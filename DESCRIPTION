@@ -43,3 +43,5 @@ Suggests:
     org.Rn.eg.db
 Additional_repositories: https://igordot.r-universe.dev
 biocViews: Proteomics, MassSpectrometry
+URL: https://github.com/BouhaddouLab/BouQuet
+BugReports: https://github.com/BouhaddouLab/BouQuet/issues

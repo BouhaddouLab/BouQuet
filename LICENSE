@@ -1,0 +1,8 @@
+Copyright (c) Bouhaddou Lab, University of California, Los Angeles.
+All rights reserved. For use by members of the Bouhaddou Lab and collaborators.
+
+Third-party data in inst/extdata keeps its own license:
+  - Regulatory_sites_*.tsv.gz: PhosphoSitePlus(R), Cell Signaling Technology Inc.,
+    licensed under CC BY-NC-SA 3.0 (non-commercial use only). Acknowledge
+    PhosphoSitePlus(R), www.phosphosite.org, when you use it.
+  - kinaseSiteList_BachmanGyoriSorger2019.csv.gz: Bachman, Gyori & Sorger (2019).

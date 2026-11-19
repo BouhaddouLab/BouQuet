@@ -1,0 +1,915 @@
+---
+title: "BouQuet: Bouhaddou Lab Quantitative proteomics Toolkit"
+author: "Bouhaddou Lab"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+
+
+
+# PART A: Setup and Import
+
+### A1: Setup (the ONLY chunk you should need to edit)
+```{r setup}
+
+# ---- Edit these for each experiment ----
+data_type      = "phospho"       # "abundance", "phospho" or "ubiquitin"
+species        = "human"         # "human", "mouse" or "rat"
+ptm_type       = "Phospho"       # PTM name as it appears in EG.ModifiedSequence, e.g. "Phospho" or "GlyGly"
+
+input_file     = "data/20251104_193535_SM19_PH_Report_filt.tsv"   # Spectronaut report (MSstats scheme)
+keys_file      = "data/keys.csv"           # created in A2 if it does not exist yet
+contrasts_file = "data/contrasts.txt"
+
+qvalue_cutoff         = 0.01               # precursor FDR
+ptm_loc_prob          = 0.75               # localization probability cutoff for site-level quant
+msstats_normalization = "equalizeMedians"  # FALSE = no normalization (e.g. APEX experiments)
+log2fc_cutoff         = 1                  # |log2FC| >= 1 means 2-fold
+adjp_cutoff           = 0.05
+enrich_background     = "detected"         # enrichment background: "detected" or "database"
+
+db_refresh = FALSE   # Online databases (UniProt gene names, OmniPath, ...) are downloaded the first time they are needed,
+                     # then reused from the cache. TRUE = download fresh copies this run
+psp_file   = NULL    # PhosphoSitePlus Regulatory_sites file; NULL = newest in resources/, then the cache, then the copy built into BouQuet
+
+
+# ---------------- Nothing below here needs editing ----------------
+stopifnot(data_type %in% c("abundance", "phospho", "ubiquitin"))
+
+# Load BouQuet (all its functions, plus data.table, dplyr, ggplot2, ggcorrplot, patchwork, ComplexHeatmap and MSstats)
+library(BouQuet)
+check_packages()   # lists optional packages that are not installed
+
+# Output folders
+results_dir = "results"; fig_dir = "figures"
+invisible(lapply(c(results_dir, fig_dir), dir.create, showWarnings = FALSE))
+
+# Settings for the database helpers: one shared download cache per computer, reused until db_refresh = TRUE
+options(ptm.db_dir = tools::R_user_dir("BouQuet", which = "cache"), ptm.db_refresh = db_refresh,
+        ptm.db_max_age_days = Inf, ptm.results_dir = results_dir, ptm.psp_file = psp_file)
+
+# Word used in plot labels
+what = c(abundance = "proteins", phospho = "phosphosites", ubiquitin = "ubiquitination sites")[[data_type]]
+
+```
+### A2: Import data and create keys file
+```{r}
+  
+# Import data
+input.report <- fread(input_file)
+
+# Create starting point keys file and write out to file. It will not create a keys file if one already exists in the data folder.
+if (!file.exists(keys_file)){
+  keys <- input.report[, .(Condition = R.Condition[1], BioReplicate = R.Replicate[1]), by = .(RawFile = R.FileName)]
+  setorder(keys, RawFile)
+  keys[, `:=`(IsotopeLabelType = "L",
+              Run              = seq_len(.N),
+              Passed_QC        = TRUE,
+              Fraction         = NA,
+              SAINT            = NA,
+              Batch            = NA,
+              SampleName       = NA,
+              PlateNumber      = NA,
+              Cells            = NA)]
+  fwrite(keys, keys_file, na = "NA")
+  message("Created ", keys_file)
+} else {
+  keys <- fread(keys_file)
+  message("Using existing ", keys_file)
+}
+  
+
+```
+### A3: Add keys, remove samples that do not pass QC, annotate ptm data
+```{r}
+
+# To remove more samples later: change `Passed_QC` in the keys file and re-run from A1.
+
+# Load the keys file and look up each run once
+keys <- fread(keys_file)
+k <- match(input.report$R.FileName, keys$RawFile)
+input.report[, `:=`(R.Condition = keys$Condition[k],
+                    R.Replicate = paste0(keys$Condition[k], ".", keys$BioReplicate[k]),
+                    R.Passed_QC = keys$Passed_QC[k])]
+
+# Remove files that do not pass QC (and files missing from the keys file)
+input.report = input.report[R.Passed_QC == TRUE]
+
+# Show the samples that were kept
+print(unique(input.report[, .(R.FileName, R.Condition, R.Replicate)])[order(R.Replicate)])
+
+
+if (data_type == "phospho" | data_type == "ubiquitin"){
+
+  # These annotations depend only on four columns, so build them once per unique combination
+  # (far fewer than the report's rows) and join them back
+  ann = unique(input.report[, .(PG.ProteinGroups, PEP.StrippedSequence, EG.ModifiedSequence, EG.ProteinPTMLocations)])
+
+  # Protein_StrippedSequence_<ptm_type><number of mods>, e.g. "P12345_PEPTIDEK_Phospho2"
+  n_ptm = stringr::str_count(ann$EG.ModifiedSequence, stringr::fixed(ptm_type))
+  ann[, PEP.StrippedSequencePTM := paste0(PG.ProteinGroups, "_", PEP.StrippedSequence, ifelse(n_ptm > 0, paste0("_", ptm_type, n_ptm), ""))]
+
+  # Drop Met oxidation and Cys carbamidomethyl positions
+  locs = gsub(",\\)", ")", gsub("[MC][0-9]+,?", "", ann$EG.ProteinPTMLocations))
+  # Peptides from repeated sequences list each possible location in its own parentheses, e.g. "(T915)(T1131)": join them with "|" (= "or")
+  locs = gsub("\\)\\(", "|", gsub("\\(\\)(?=\\()|(?<=\\))\\(\\)", "", locs, perl = TRUE))
+  # ProteinSites, e.g. "P12345_S10_T12" (two sites) or "A6H8Y1_T915|T1131" (one site, two possible positions)
+  ann[, PG.ProteinSites := gsub("_(?=;|$)", "",
+                                mapply(function(p, s) paste0(p, "_", s, collapse = ";"),
+                                       strsplit(PG.ProteinGroups, ";"),
+                                       strsplit(gsub("[()]", "", gsub(",", "_", locs)), ";")),
+                                perl = TRUE)]
+
+  # Add both columns to the report
+  input.report[ann, on = .(PG.ProteinGroups, PEP.StrippedSequence, EG.ModifiedSequence, EG.ProteinPTMLocations),
+               `:=`(PEP.StrippedSequencePTM = i.PEP.StrippedSequencePTM, PG.ProteinSites = i.PG.ProteinSites)]
+}
+```
+
+
+
+# Part B: Quality Control (QC)
+
+### B1: QC: peptide/protein counts, boxplots, correlations, and PCA
+```{r}
+plots <- list()   # collects every QC plot for the combined PDF
+
+# The report repeats each precursor's values on every fragment row, so every step below first keeps
+# only the unique rows it needs (one per precursor per run), which is much faster
+
+if (data_type == "abundance") {
+
+# ABUNDANCE PROTEOMICS
+
+  # Count unique features, peptides, protein groups and proteins
+  unique_counts <- unique(input.report[!is.na(PEP.Quantity) & PEP.Quantity != 0,
+                                       .(R.Replicate, EG.PrecursorId, EG.ModifiedSequence, PEP.StrippedSequence, PG.ProteinGroups)]) %>%
+    group_by(Sample = R.Replicate) %>%
+    summarize(Unique_Feature_Count = n_distinct(EG.PrecursorId),
+              Unique_FeatureNoCharge_Count = n_distinct(EG.ModifiedSequence),
+              Unique_Peptide_Count = n_distinct(PEP.StrippedSequence),
+              Unique_ProteinGroup_Count = n_distinct(PG.ProteinGroups),
+              Unique_Protein_Count = n_distinct(unlist(strsplit(unique(PG.ProteinGroups), ";"))))
+  print(unique_counts)
+
+  # Create a grouped bar graph of unique features and peptides
+  p = ggplot(tidyr::pivot_longer(unique_counts, c(Unique_Feature_Count, Unique_FeatureNoCharge_Count, Unique_Peptide_Count)),
+             aes(x = Sample, y = value, fill = name)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.9) +
+    geom_text(aes(label = value), position = position_dodge(width = 0.9), hjust = 1.1, color = "black", size = 2.5, angle=90) + # Label each bar with the count number
+    labs(title = "Unique Features and Peptides per Sample (ab)", # Set the title of the figure
+         x = "Sample", # Set title of the x axis
+         y = "Count", # Set title of the y axis
+         fill = NULL) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+  # Create a grouped bar graph of unique protein groups and proteins
+  p = ggplot(tidyr::pivot_longer(unique_counts, c(Unique_ProteinGroup_Count, Unique_Protein_Count)),
+             aes(x = Sample, y = value, fill = factor(name, levels = c("Unique_ProteinGroup_Count", "Unique_Protein_Count")))) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.9) +
+    geom_text(aes(label = value), position = position_dodge(width = 0.9), hjust = 1.1, color = "black", size = 2.5, angle=90) + # Label each bar with the count number
+    labs(title = "Unique Protein Groups and Proteins per Sample (ab)", # Set the title of the figure
+         x = "Sample", # Set title of the x axis
+         y = "Count", # Set title of the y axis
+         fill = NULL) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+} else if (data_type == "phospho" | data_type == "ubiquitin") {
+
+# PTM PROTEOMICS
+
+  # Identified, quantified peptides per sample (one row per peptide per sample), flagged for carrying the PTM
+  ptm_rows <- unique(input.report[FG.Quantity > 0 & EG.Qvalue <= 0.01,
+                                  .(R.Replicate, PEP.StrippedSequencePTM, PG.ProteinGroups, EG.PTMAssayProbability)])
+  ptm_rows[, is_ptm := grepl(ptm_type, PEP.StrippedSequencePTM, fixed = TRUE)]
+
+  # Count non-PTM and PTM peptides (stripped sequence + number of PTMs) per sample
+  unique_counts <- ptm_rows %>%
+    group_by(Sample = R.Replicate) %>%
+    summarize(NonPTM_Peptide_Count = n_distinct(PEP.StrippedSequencePTM[!is_ptm]), # peptides with no PTM
+              PTM_Peptide_Count_HCL = n_distinct(PEP.StrippedSequencePTM[is_ptm & EG.PTMAssayProbability >= ptm_loc_prob]),
+              PTM_Peptide_Count    = n_distinct(PEP.StrippedSequencePTM[is_ptm]),
+              Total_Peptide_Count  = n_distinct(PEP.StrippedSequencePTM),
+              Unique_ProteinGroup_Count = n_distinct(PG.ProteinGroups[is_ptm]),
+              Unique_Protein_Count = n_distinct(unlist(strsplit(unique(PG.ProteinGroups[is_ptm]), ";")))) %>% # proteins with >= 1 PTM peptide
+    mutate(PTM_Enrichment = 100 * PTM_Peptide_Count / Total_Peptide_Count) # Percent of peptides carrying the PTM
+  print(unique_counts)
+
+  # Create a grouped bar graph of non-PTM, PTM and total peptides
+  plot_data = tidyr::pivot_longer(unique_counts, c(NonPTM_Peptide_Count, PTM_Peptide_Count, Total_Peptide_Count, PTM_Peptide_Count_HCL))
+  plot_data$name = factor(plot_data$name, levels = c("NonPTM_Peptide_Count", "PTM_Peptide_Count", "Total_Peptide_Count", "PTM_Peptide_Count_HCL")) # Set bar order
+
+  p = ggplot(plot_data, aes(x = Sample, y = value, fill = name)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.9) +
+    geom_text(aes(label = value), position = position_dodge(width = 0.9), hjust = 1.1, color = "black", size = 2.5, angle = 90) + # Label each bar with the count number
+    geom_text(data = unique_counts, aes(x = Sample, y = Total_Peptide_Count, label = sprintf("%.1f%%", PTM_Enrichment)),
+              inherit.aes = FALSE, vjust = -0.5, size = 3) + # Label each group with the PTM enrichment
+    scale_fill_discrete(labels = c("NonPTM_Peptide_Count", "PTM_Peptide_Count", "Total_Peptide_Count", "PTM_Peptide_Count_HCL")) + # Set legend labels
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + # Leave room above bars for the enrichment label
+    labs(title = "Non-PTM and PTM Peptides per Sample", # Set the title of the figure
+         subtitle = "Percent above each sample = PTM enrichment (PTM / Total)", # Explain the annotation
+         x = "Sample", # Set title of the x axis
+         y = "Count", # Set title of the y axis
+         fill = NULL) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+
+  ## PTM multiplicity
+  # Unique peptides per sample, using the same filters as the counts above
+  ptm_dist = unique(ptm_rows[, .(Sample = R.Replicate, PEP.StrippedSequencePTM)])
+  # Number of PTMs = the number at the end of the label (0 if no ptm_type in the label)
+  ptm_dist[, n_ptm := 0L]
+  ptm_dist[grepl(ptm_type, PEP.StrippedSequencePTM, fixed = TRUE), n_ptm := as.integer(sub("^.*[^0-9]([0-9]+)$", "\\1", PEP.StrippedSequencePTM))]
+  # Group into Non-PTM, 1, 2, 3, 4+
+  lev = c("Non-PTM", paste0(1:3, " ", ptm_type), paste0("4+ ", ptm_type))
+  ptm_dist[, Category := factor(lev[pmin(n_ptm, 4) + 1], levels = lev)]
+  # Count per sample; fill in 0 for categories a sample doesn't have, so bars stay aligned and get a "0" label
+  mult_counts = ptm_dist[, .N, by = .(Sample, Category)]
+  mult_counts = tidyr::complete(mult_counts, Sample, Category, fill = list(N = 0L))
+  p = ggplot(mult_counts, aes(x = Sample, y = N, fill = Category)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.9) +
+    geom_text(aes(label = N), position = position_dodge(width = 0.9), hjust = -0.1, color = "black", size = 2.5, angle = 90) + # Label each bar with the count, above the bar
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + # Leave room above bars for the labels
+    labs(title = paste("Peptides by Number of", ptm_type, "Modifications per PTM Peptide"),
+         x = "Sample",
+         y = "Count",
+         fill = NULL) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+
+  # Protein count
+  # Create a grouped bar graph of unique protein groups and proteins
+  p = ggplot(tidyr::pivot_longer(unique_counts, c(Unique_ProteinGroup_Count, Unique_Protein_Count)),
+             aes(x = Sample, y = value, fill = factor(name, levels = c("Unique_ProteinGroup_Count", "Unique_Protein_Count")))) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.9) +
+    geom_text(aes(label = value), position = position_dodge(width = 0.9), hjust = 1.1, color = "black", size = 2.5, angle=90) + # Label each bar with the count number
+    labs(title = "Unique Protein Groups and Proteins per Sample (ptm)", # Set the title of the figure
+         x = "Sample", # Set title of the x axis
+         y = "Count", # Set title of the y axis
+         fill = NULL) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+}
+
+
+## BOXPLOTS, CORRELATIONS, AND PCA (all data types)
+
+  # One quantified value per precursor per run, used by all plots below
+  prec = unique(input.report[FG.Quantity > 0, .(R.Replicate, R.Condition, Precursor = EG.PrecursorId, FG.Quantity)])
+  prec[, quant := log2(FG.Quantity)]
+
+
+  ## BOXPLOT OF PEPTIDE INTENSITIES ACROSS RUNS PRE-NORM
+  p = ggplot(prec, aes(x = R.Replicate, y = quant, fill = R.Condition)) +
+    geom_boxplot(outliers = FALSE) +
+    labs(title = "Boxplots of log2(Intensity) of Peptides by Condition: Pre-Norm", y = "log2(FG.Quantity)") + #Set Graph Title
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+
+  ## CORRELATION MATRIX
+  # Matrix of log2 intensities: one row per precursor, one column per sample
+  in.wide = dcast(prec, Precursor ~ R.Replicate, value.var = "quant")
+  mat.in = as.matrix(in.wide, rownames = "Precursor")
+  # Calculate the correlation of each of the sample comparisons
+  res = cor(mat.in, use = "complete.obs")
+  # Sort rows and columns alphabetically so both axes are in the same order
+  ord = sort(colnames(res))
+  res = res[ord, ord]
+  # Create the correlation matrix with the calculated values
+  p = ggcorrplot(res,
+                 hc.order = FALSE, # Keep the alphabetical order (no clustering)
+                 type = "full", # Fill in the whole matrix
+                 lab = TRUE, # Label each comparison with their correlation coefficient
+                 title = "Correlation Matrix of Feature Intensities", # Set the title of the figure
+                 show.diag = TRUE, # Whether to include the diagonal comparison of the same condition being compared to itself
+                 outline.color = "white",
+                 ggtheme = ggplot2::theme_gray,
+                 legend.title = "Pearson's r", # Set the legend title
+                 lab_size = (0.2+(27/sqrt(length(res)))), # Adjust label size
+                 tl.cex = 8, # Adjust size of axis tick labels
+                 tl.col = "black", # Color of axis tick labels
+                 tl.srt = 90) + # Rotate axis tick labels
+    ggplot2::scale_y_discrete(limits = rev) # Flip rows so they run A→Z top to bottom, matching the columns
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+
+  ## WITHIN- vs BETWEEN-CONDITION CORRELATIONS
+  # Map each sample to its condition
+  cond_map = unique(prec[, .(R.Replicate, R.Condition)])
+  # Take each pair of runs once (upper triangle, no diagonal)
+  idx = which(upper.tri(res), arr.ind = TRUE)
+  pairs = data.table(Sample1 = rownames(res)[idx[, 1]],
+                     Sample2 = colnames(res)[idx[, 2]],
+                     r       = res[idx])
+  # Look up the condition of each run in the pair
+  pairs[, Cond1 := cond_map$R.Condition[match(Sample1, cond_map$R.Replicate)]]
+  pairs[, Cond2 := cond_map$R.Condition[match(Sample2, cond_map$R.Replicate)]]
+  # Label pairs as within or between conditions
+  pairs[, Comparison := factor(ifelse(Cond1 == Cond2, "Within condition", "Between conditions"),
+                               levels = c("Within condition", "Between conditions"))]
+  # Plot
+  p2 = ggplot(pairs, aes(x = Comparison, y = r)) +
+    geom_boxplot(outlier.shape = NA, width = 0.5) + # Hide outlier dots; every pair is shown as a point below
+    geom_jitter(width = 0.1, height = 0, size = 1.5, alpha = 0.7) + # Show each pair of runs (sideways spread only)
+    labs(title = "Correlation of Runs Within vs. Between Conditions",
+         x = NULL,
+         y = "Pearson's r") +
+    ylim(c(NA,1)) +
+    theme_classic() +
+    theme(legend.position = "none")
+  print(p2)
+  plots[[length(plots) + 1]] <- p2
+
+
+  # CORRELATION BOXPLOTS (within-condition replicate pairs, per condition)
+  within = pairs[Comparison == "Within condition"]
+  p = ggplot(within, aes(x = Cond1, y = r)) +
+    geom_boxplot(color = "black", outlier.shape = NA) + # Every pair is shown as a point below
+    geom_jitter(width = 0.2, height = 0, size = 2) + # Spread points sideways only, so r values stay exact
+    ylim(c(0, 1)) +
+    geom_hline(yintercept = 1) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    ylab("Pearson's r") + xlab("Condition")
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+
+  ## PCA OF PRE-NORMALIZED FEATURE DATA
+  # Precursors quantified in every sample (same log2 matrix as the correlations)
+  protQuant.mat.complete = mat.in[complete.cases(mat.in), ]
+  # Do PCA
+  pcaOut = prcomp(t(protQuant.mat.complete))
+  variance <- (pcaOut$sdev)^2
+  variance_explained <- variance / sum(variance)
+  # Get data ready to plot
+  pcaDT = as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaDT$GROUP = gsub("\\..*","",pcaDT$rn)
+  pcaDT$RUN = gsub(".*\\.", "", pcaDT$rn)
+  # Extract explained variance for PC1 and PC2
+  explained_variance_pc1 <- round(variance_explained[1] * 100, 2)
+  explained_variance_pc2 <- round(variance_explained[2] * 100, 2)
+  # Plot the pre normalized PCA
+  p = ggplot(pcaDT, aes(x = PC1, y = PC2, color = GROUP)) +
+    geom_point() +
+    ggtitle("Pre-Normalized Feature PCA") + # Set the figure title
+    ggrepel::geom_text_repel(aes(label = RUN)) + # Label the points with run number
+    labs(x = paste("PC1 (", explained_variance_pc1, "%)", sep = ""), # Label the x axis, including the explained variance
+         y = paste("PC2 (", explained_variance_pc2, "%)", sep = "")) + # Label the y axis, including the explained variance
+    theme_classic() +
+    theme(text = element_text(size=14),
+          legend.title = element_text(size = 10), # Set the size of the legend
+          legend.text = element_text(size = 8),
+          legend.key.size = unit(0.7, "lines"),
+          legend.key.height = unit(0.5, "lines"),
+          legend.key.width = unit(1, "lines"))
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+
+  ## Save all QC plots into one multi-page PDF (one page per plot)
+  pdf(file.path(fig_dir, paste0("QC_", c(abundance = "ab", phospho = "ptm", ubiquitin = "ptm")[[data_type]], ".pdf")), width = 10, height = 8)
+  for (pl in plots) print(pl)
+  dev.off()
+
+
+  ## Combined, publication-style figure: every QC plot as a lettered panel
+  qc_fig = wrap_plots(plots, ncol = 3) +
+    plot_annotation(tag_levels = "A") &                                   # label panels A, B, C, ...
+    theme(text = element_text(size = 10), plot.title = element_text(size = 10),
+          legend.text = element_text(size = 7), legend.key.size = unit(0.35, "cm"))
+  ggsave(file.path(fig_dir, paste0("QC_", c(abundance = "ab", phospho = "ptm", ubiquitin = "ptm")[[data_type]], "_panels.pdf")),
+         qc_fig, width = 18, height = 5 * ceiling(length(plots) / 3), limitsize = FALSE)
+```
+
+
+# Part C: MSstats
+
+## C1: MSstats: AB Quant
+```{r}
+
+if (data_type == "abundance"){
+
+# FOR PROTEIN LEVEL AB QUANT
+# This performs quantification and comparisons at the protein level, using the protein groups (PG.ProteinGroups) as reported by Spectronaut.
+
+## PREPARE FOR MSSTATS
+global.prepared <- SpectronauttoMSstatsFormat(
+    input.report,
+    useUniquePeptide = TRUE,
+    filter_with_Qvalue = TRUE,
+    qvalue_cutoff = qvalue_cutoff,
+    removeProtein_with1Feature = FALSE,
+    removeFewMeasurements = FALSE,
+    use_log_file = FALSE)
+# Remove zero and missing intensities, and save the data into the results folder
+global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
+Save.Csv(global.prepared, "CleanedPreprocessedData_PeptideQuant.csv", results_dir)
+  
+
+## MSSTATS SUMMARIZATION AND NORMALIZATION
+global.proteinSummarization = MSstats::dataProcess(global.prepared,
+                                                   normalization = msstats_normalization,
+                                                   logTrans = 2,
+                                                   #featureSubset = 'highQuality',
+                                                   summaryMethod="TMP",
+                                                   censoredInt='NA',
+                                                   MBimpute=FALSE,
+                                                   maxQuantileforCensored=0.999)
+# Save the feature level data and the protein level data into seperate files in the results folder
+Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_PeptideQuant.csv", results_dir)
+Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_PeptideQuant.csv", results_dir)
+
+
+## MSSTATS GROUP COMPARISONS
+#Load in the Contrast File
+global.regexContrasts <- fread(contrasts_file, header = FALSE, blank.lines.skip = T)
+global.regexContrasts <- t(global.regexContrasts)
+# makes an MsStats-compatible contrast matrix using the condition comparisons in the parameter block
+contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
+                                            condition.vector = global.regexContrasts)
+global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization)$ComparisonResult
+# Save the global pairwise comparisons in the results folder
+Save.Csv(global.pairwiseComparison, "GroupComparisonsData_PeptideQuant.csv", results_dir)
+
+} else {
+  message("Your data type is not abundance")
+}
+
+```
+## C2: MSstats: PTM Site Quant
+```{r}
+
+if (data_type == "phospho" | data_type == "ubiquitin"){
+
+# FOR SITE-LEVEL PTM QUANT -- HIGHLY LOCALIZED ONLY
+# This performs quantification and comparisons at the phosphopeptide level (site agnostic) using the PEP.StrippedPeptidePTM column for annotation (Protein_StrippedPeptide_NumberofMods). This is useful for GSOA studies and uses more of your data.
+
+## PREPARE FOR MSSTATS
+# Threshold for highly localized sites only, this is very important to do when you are quantifying at the site level becuase if not you could be quantifying sites that are not well localized and represent essentially made up data!
+input.report.ptm = input.report[input.report$EG.PTMAssayProbability >= ptm_loc_prob &
+                                grepl(ptm_type, input.report$EG.ModifiedSequence, fixed = TRUE), ]
+# Define input
+input.report.ptm$PG.ProteinGroups = input.report.ptm$PG.ProteinSites
+# Run MSstats formatting
+global.prepared <- suppressWarnings(SpectronauttoMSstatsFormat(
+    input.report.ptm,
+    useUniquePeptide = TRUE,
+    filter_with_Qvalue = TRUE,
+    qvalue_cutoff = qvalue_cutoff,
+    removeProtein_with1Feature = FALSE,
+    removeFewMeasurements = FALSE,
+    use_log_file = FALSE))
+# Free memory
+rm(input.report.ptm)
+# Remove zero and missing intensities, and save the data into the results folder
+global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
+Save.Csv(global.prepared, "CleanedPreprocessedData_PTMSiteQuant.csv", results_dir)
+  
+
+## MSSTATS SUMMARIZATION AND NORMALIZATION
+global.proteinSummarization = MSstats::dataProcess(global.prepared,
+                                                   normalization = msstats_normalization,
+                                                   logTrans = 2,
+                                                   #featureSubset = 'highQuality',
+                                                   summaryMethod="TMP",
+                                                   censoredInt='NA',
+                                                   MBimpute=FALSE,
+                                                   maxQuantileforCensored=0.999,
+                                                   use_log_file = FALSE)
+# Convert Uniprot IDs to Gene Symbols
+global.proteinSummarization$FeatureLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$FeatureLevelData$PROTEIN), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+global.proteinSummarization$ProteinLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$ProteinLevelData$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+# Save the feature level data and the protein level data into seperate files in the results folder
+Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_PTMSiteQuant.csv", results_dir)
+Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_PTMSiteQuant.csv", results_dir)
+
+
+## MSSTATS GROUP COMPARISONS
+#Load in the Contrast File
+global.regexContrasts <- fread(contrasts_file, header = FALSE, blank.lines.skip = T)
+global.regexContrasts <- t(global.regexContrasts)
+# makes an MsStats-compatible contrast matrix using the condition comparisons in the parameter block
+contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
+                                            condition.vector = global.regexContrasts)
+global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization, use_log_file = FALSE)$ComparisonResult
+# Convert Uniprot IDs to Gene Symbols
+global.pairwiseComparison$GeneName <- convert_geneids(gsub("[_;].*", "", global.pairwiseComparison$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+# Annotate significance
+global.pairwiseComparison <- global.pairwiseComparison %>%
+  mutate(significance = case_when(
+    log2FC ==  Inf                                       ~ "Inf Upregulated",
+    log2FC == -Inf                                       ~ "Inf Downregulated",
+    log2FC >=  log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Upregulated",
+    log2FC <= -log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Downregulated",
+    .default = "Not Significant"))
+# Save the global pairwise comparisons in the results folder
+Save.Csv(global.pairwiseComparison, "GroupComparisonsData_PTMSiteQuant.csv", results_dir)
+
+} else {
+  message("Your data type is not phospho or ubiquitin")
+}
+
+```
+## C3: MSstats: PTM Peptide Quant
+```{r}
+
+if (data_type == "phospho" | data_type == "ubiquitin"){
+
+# FOR PEPTIDE PTM QUANT
+# This performs quantification and comparisons at the phosphopeptide level (site agnostic) using the PEP.StrippedPeptidePTM column for annotation (Protein_StrippedPeptide_NumberofMods). This is useful for GSOA studies and uses more of your data.
+
+## PREPARE FOR MSSTATS
+input.report.ptm = input.report
+input.report.ptm$PG.ProteinGroups = input.report.ptm$PEP.StrippedSequencePTM
+global.prepared <- suppressWarnings(SpectronauttoMSstatsFormat(
+    input.report.ptm,
+    useUniquePeptide = TRUE,
+    filter_with_Qvalue = TRUE,
+    qvalue_cutoff = qvalue_cutoff,
+    removeProtein_with1Feature = FALSE,
+    removeFewMeasurements = FALSE,
+    use_log_file = FALSE))
+# Free memory
+rm(input.report.ptm)
+# Remove zero and missing intensities, and save the data into the results folder
+global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
+Save.Csv(global.prepared, "CleanedPreprocessedData_PeptideQuant.csv", results_dir)
+  
+
+## MSSTATS SUMMARIZATION AND NORMALIZATION
+global.proteinSummarization = MSstats::dataProcess(global.prepared,
+                                                   normalization = msstats_normalization,
+                                                   logTrans = 2,
+                                                   #featureSubset = 'highQuality',
+                                                   summaryMethod="TMP",
+                                                   censoredInt='NA',
+                                                   MBimpute=FALSE,
+                                                   maxQuantileforCensored=0.999)
+# Convert Uniprot IDs to Gene Symbols
+global.proteinSummarization$FeatureLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$FeatureLevelData$PROTEIN), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+global.proteinSummarization$ProteinLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$ProteinLevelData$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+# Save the feature level data and the protein level data into seperate files in the results folder
+Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_PeptideQuant.csv", results_dir)
+Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_PeptideQuant.csv", results_dir)
+
+
+## MSSTATS GROUP COMPARISONS
+#Load in the Contrast File
+global.regexContrasts <- fread(contrasts_file, header = FALSE, blank.lines.skip = T)
+global.regexContrasts <- t(global.regexContrasts)
+# makes an MsStats-compatible contrast matrix using the condition comparisons in the parameter block
+contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
+                                            condition.vector = global.regexContrasts)
+global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization)$ComparisonResult
+# Convert Uniprot IDs to Gene Symbols
+global.pairwiseComparison$GeneName <- convert_geneids(gsub("[_;].*", "", global.pairwiseComparison$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+# Annotate significance
+global.pairwiseComparison <- global.pairwiseComparison %>%
+  mutate(significance = case_when(
+    log2FC ==  Inf                                       ~ "Inf Upregulated",
+    log2FC == -Inf                                       ~ "Inf Downregulated",
+    log2FC >=  log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Upregulated",
+    log2FC <= -log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Downregulated",
+    .default = "Not Significant"))
+# Save the global pairwise comparisons in the results folder
+Save.Csv(global.pairwiseComparison, "GroupComparisonsData_PeptideQuant.csv", results_dir)
+
+} else {
+  message("Your data type is not phospho or ubiquitin")
+}
+
+```
+
+
+
+
+Part D: Differential Abundance (DA) Analyses
+
+### D1: Basic DA plots: volcano plots, bar plots, heatmap, CVs
+```{r}
+
+## Run everything below once per quantification level; each gets its own multi-page PDF
+for (quant_type in c("PTMSiteQuant", "PeptideQuant")) {
+
+  plots <- list()   # collects every plot for this quant_type's combined PDF
+
+  ## VOLCANO PLOTS
+
+  # Load in required files
+  global.regexContrasts <- t(fread(contrasts_file, header = FALSE, blank.lines.skip = T))
+  gc_file <- file.path(results_dir, paste0("GroupComparisonsData_", quant_type, ".csv"))
+  pl_file <- file.path(results_dir, paste0("ProteinLevelData_", quant_type, ".csv"))
+
+  # Skip this quant_type if either of its input files is missing
+  if (!file.exists(gc_file) || !file.exists(pl_file)) {
+    message("Missing ", quant_type, " input file(s); skipping ", quant_type)
+    next
+  }
+
+  global.pairwiseComparison <- fread(gc_file)
+  ProteinLevelData <- fread(pl_file)
+
+  # p-value and fold change cutoffs (from Setup; l2_num is the fold change, e.g. 2 = 2-fold)
+  p_num = adjp_cutoff
+  l2_num = 2^log2fc_cutoff
+
+  for (comparison in global.regexContrasts) {
+
+    # define significant proteins
+    thisPairwiseComparison <- as.data.table(global.pairwiseComparison %>% filter(Label == comparison))
+
+    ## This chunks adds a new column to our pairwise comparison data table
+    # For all proteins with |Log2FC| < 1 and pval > 0.05, value is "Not"
+    # For proteins with |Log2FC| >= 1 and pval <= 0.05, value is "Up" or "Down" as appropriate
+    thisPairwiseComparison[, Significance := "Not"]
+    thisPairwiseComparison[adj.pvalue < p_num & abs(log2FC) > log2(l2_num),
+                           Significance := ifelse (log2FC > 0, "Up", "Down")]
+
+    ## Render volcano plots
+    plot <- ggplot(thisPairwiseComparison, aes(x = log2FC, y = -log10(adj.pvalue), color = Significance)) +
+
+      # significance labels and lines
+      # vertical lines
+      geom_vline(xintercept = c(-log2(l2_num), log2(l2_num)), linetype = "dashed", color = "darkgray") +
+      annotate("text", x = c(log2(l2_num)), y = 0, label = c(paste0("Log2(", l2_num, ")")), vjust = 1, hjust = -0.1, color = "darkgray") +
+
+      # horizontal line
+      geom_hline(yintercept = -log10(p_num), linetype = "dashed", color = "darkgray") +
+      annotate("text", x = Inf, y = -log10(p_num), label = paste0("adj.p = ", p_num), hjust = 1, vjust = 1.5, color = "darkgray") +
+
+      # circles representing proteins
+      geom_point() +
+      ggtitle(paste0(c(abundance = "Abundance Proteomics: ", phospho = "PTM Proteomics: ", ubiquitin = "PTM Proteomics: ")[[data_type]], comparison, " (", quant_type, ")")) +
+      scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+      theme_classic()
+
+    print(plot)
+    plots[[length(plots) + 1]] <- plot
+  }
+
+  ## BAR PLOT: NUMBER OF SIGNIFICANTLY CHANGING PROTEINS/SITES PER CONTRAST
+
+  # Rf is the group comparisons data for this quant_type, with a significance column added
+  Rf <- global.pairwiseComparison %>%
+    mutate(
+      pvalue = ifelse(is.na(pvalue), 0, pvalue),
+      significance = case_when(
+        is.infinite(log2FC) & log2FC > 0 ~ "Inf Upregulated",
+        is.infinite(log2FC) & log2FC < 0 ~ "Inf Downregulated",
+        log2FC >= log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Upregulated",
+        log2FC <= -log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    )
+  #order of significance categories
+  Rf$significance = factor(Rf$significance,
+                           levels = c("Inf Upregulated", "Upregulated",
+                                      "Not Significant", "Downregulated",
+                                      "Inf Downregulated"))
+  #barplot
+  g = ggplot(Rf, aes(x = Label, fill = significance)) +
+    geom_bar(position = "stack") +
+    scale_fill_manual(values = c(
+      "Inf Upregulated" = "darkred",
+      "Upregulated" = "red",
+      "Not Significant" = "grey",
+      "Downregulated" = "blue",
+      "Inf Downregulated" = "darkblue")) +
+    labs(title = paste0("Significant Changes per Contrast (", quant_type, ")"),
+         x = "Label", y = paste("Number of", what), fill = "Change direction") +
+    theme(
+      axis.line = element_line(color = "black"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      panel.background = element_blank(),
+      axis.text = element_text(size = 12),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+      axis.title.x = element_blank(),
+      legend.title = element_blank()
+    )
+  print(g)
+  plots[[length(plots) + 1]] <- g
+
+  ## CVs PER PROTEIN / SITE ACROSS CONDITIONS
+
+  #ProteinLevelData <- global.proteinSummarization$ProteinLevelData
+
+  # Calculate the coefficient of variation distribution of each condition
+  proteomics_data <- ProteinLevelData %>%
+    group_by(GROUP,Protein) %>%
+    summarize(CV = sd(2^LogIntensities, na.rm = TRUE) / mean(2^LogIntensities, na.rm = TRUE) * 100)
+
+  # Median CV per group, for the text labels
+  median_CVs <- proteomics_data %>%
+    group_by(GROUP) %>%
+    summarize(median_CV = median(CV, na.rm = TRUE))
+
+  # Plot the distribution of CV for each group
+  p = ggplot(proteomics_data, aes(x = GROUP, y = CV)) +
+    geom_boxplot(outliers=FALSE) +
+    geom_text(data = median_CVs, aes(x = GROUP, y = Inf, label = sprintf("%.1f%%", median_CV)),
+              vjust = 1.5, size = 3) +
+    labs(title = paste0("Coefficient of Variation Distribution by Condition (", quant_type, ")"), # Set the title of the figure
+         x = "Please note CV's were calculated in linear space", # Set the title of the x axis
+         y = "Coefficient of Variation (%)") + # Set the title of the y axis
+    theme_classic() + coord_cartesian(ylim = c(0, 100)) +
+    theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+  print(p)
+  plots[[length(plots) + 1]] <- p
+
+  ## Save all plots for this quant_type into one multi-page PDF (one page per plot)
+  pdf(file.path(fig_dir, paste0("DA_", quant_type, ".pdf")))
+  for (pl in plots) if (inherits(pl, "Heatmap")) draw(pl) else print(pl)
+  dev.off()
+}
+
+
+```
+### D2: Gene Set Over-representation Analysis (GSOA): C5 (GO biological process) and C2 (canonical pathways) GSOA
+```{r}
+
+# Gene-set databases: fetched once, reused for both quantification levels
+dbs = list(GOBP     = list(gmt = get_msigdb("C5", "GO:BP"), width = 10, height = 10),
+           pathways = list(gmt = get_msigdb("C2", "CP"),    width = 9,  height = 5.5))
+
+for (quant in c("PeptideQuant", "PTMSiteQuant")){
+  
+  # Load and threshold the group comparisons
+  global.pairwiseComparison = fread(file.path(results_dir, paste0("GroupComparisonsData_", quant, ".csv")))
+  M = unique(global.pairwiseComparison[abs(log2FC) >= log2fc_cutoff & adj.pvalue <= adjp_cutoff &
+                                         is.finite(log2FC) & !is.na(GeneName),   # removes Inf values from enrichment
+                                       .(genes = GeneName, group = Label)])
+  
+  # Background genes: NULL = all genes in the gene-set database, or all detected genes
+  background = if (enrich_background == "detected") unique(na.omit(global.pairwiseComparison$GeneName)) else NULL
+  
+  for (db in names(dbs)){
+    enrich_table = do_enrichmap(M, cutHeight = 0, topN = 10, flag_cluster_col = TRUE, flag_p = FALSE,
+                                database_in = dbs[[db]]$gmt,
+                                column_order_values = NULL, minGSSize = 10, allGenes = background)
+    fwrite(enrich_table[[1]], file = file.path(results_dir, paste0("DA_enrichment_table_", db, "_", quant, ".txt")), sep = "\t")
+    
+    # Heatmap (skipped when fewer than 2 terms were enriched)
+    if (!is.null(enrich_table[[2]])){
+      pdf(file = file.path(fig_dir, paste0("DA_enrichment_heatmap_", db, "_", quant, ".pdf")),
+          width = dbs[[db]]$width, height = dbs[[db]]$height)
+      draw(enrich_table[[2]]$hmList, heatmap_legend_side = "top")
+      dev.off()
+    }
+  }
+}
+
+```
+### D3: Kinase activity analysis with OmniPath (prior-knowledge network)
+```{r}
+
+if (data_type != "phospho") message("Skipping kinase activity (phospho only)") else {
+
+# Load global.pairwiseComparison
+global.pairwiseComparison = fread(file.path(results_dir, paste0("GroupComparisonsData_PTMSiteQuant.csv")))
+
+# Remove double sites and abiguous sites
+global.pairwiseComparison = global.pairwiseComparison[!grepl("_[A-Z][0-9]+_", global.pairwiseComparison$Protein) & !grepl("|", global.pairwiseComparison$Protein, fixed = TRUE) & !grepl(";", global.pairwiseComparison$Protein, fixed = TRUE), ]
+
+# Prepare input
+global.pairwiseComparison$Uniprot = gsub("_.*","",global.pairwiseComparison$Protein)
+global.pairwiseComparison$Site = gsub(".*_","",global.pairwiseComparison$Protein)
+global.pairwiseComparison$pos = as.numeric(gsub("[A-Z]", "", global.pairwiseComparison$Site))
+global.pairwiseComparison$aa = gsub("[0-9]", "", global.pairwiseComparison$Site)
+log2FCData = unique(global.pairwiseComparison[, .(Label, log2FC, Uniprot, Uniprot, pos, aa)])
+colnames(log2FCData) = c("group","log2FC","Protein","uniprot","pos","aa")
+
+# Do kinase activity analysis (OmniPath network: downloaded the first time, then reused unless db_refresh = TRUE;
+# writes kinaseSummaryScores.txt)
+do_KinaseActivity_Network(log2FCData,kinaseDataSource="Omnipath", out_dir = results_dir, refreshOmnipath = db_refresh)
+
+# Import kinase activity data and select top hits for heatmap (p <= 0.05 in at least one comparison)
+K = fread(file.path(results_dir, "kinaseSummaryScores.txt"))
+K.wide = dcast(K, CTRL_GENE_NAME~Label, value.var="Z")
+K.wide.p = dcast(K, CTRL_GENE_NAME~Label, value.var="pValue")
+inds = rowSums(K.wide.p[, -1] <= 0.05, na.rm = TRUE) > 0
+K.wide.filt = K.wide[inds,]
+K.wide.p.filt = K.wide.p[inds,]
+
+# Generate heatmap of results
+mat.in = as.matrix(K.wide.filt[,2:ncol(K.wide.filt)], rownames=K.wide.filt$CTRL_GENE_NAME)
+mat.in.p = as.matrix(K.wide.p.filt[,2:ncol(K.wide.p.filt)], rownames=K.wide.p.filt$CTRL_GENE_NAME)<=0.05
+mat.in.p[is.na(mat.in.p)] = FALSE
+if (nrow(mat.in) < 2) message("Fewer than 2 significant kinases; skipping heatmap") else {
+  h = Heatmap(mat.in, name = "Kinase Activity", clustering_method_rows = "ward.D2",
+              cluster_columns = ncol(mat.in) > 1,
+              cell_fun = function(j, i, x, y, width, height, fill){
+                if (mat.in.p[i,j]){
+                  grid.rect(x = x, y = y, width = width, height = height, gp = gpar(col = "black", lwd=0.7,fill = NA))}
+              })
+  draw(h)
+  pdf(file = file.path(fig_dir, "DA_kinase_heatmap.pdf"),width=5, height=20)
+  print(h)
+  dev.off()
+}
+
+}
+
+```
+### D4: Integrate functional impacts of specific phosphorylation sites (Regulatory Sites from PhosphoSitePlus)
+```{r}
+
+## Load PhosphoSitePlus Regulatory_sites: the file set as psp_file in Setup, otherwise the newest "Regulatory_sites..."
+## file in resources/, then in the database cache folder, then the copy built into BouQuet
+Rs = NULL
+if (data_type != "phospho") message("Skipping PhosphoSitePlus (phospho only)") else
+  Rs = tryCatch(get_psp_regulatory_sites(), error = function(e){ message(conditionMessage(e)); NULL })
+
+if (!is.null(Rs)) {
+
+  ## Site-level group comparisons: keep single, unambiguous sites on one protein (e.g. P31749_S473)
+  global.pairwiseComparison = fread(file.path(results_dir, "GroupComparisonsData_PTMSiteQuant.csv"))
+  global.pairwiseComparison = global.pairwiseComparison[grepl("_", Protein, fixed = TRUE) & !grepl("_[A-Z][0-9]+_", Protein) &
+                                                       !grepl("|", Protein, fixed = TRUE) & !grepl(";", Protein, fixed = TRUE)]
+  global.pairwiseComparison[, `:=`(Protein_Site  = Protein,
+                                   Uniprot       = sub("_.*", "", Protein),
+                                   GeneName_Site = paste0(GeneName, "_", sub(".*_", "", Protein)))]
+
+  ## PhosphoSitePlus: human phosphosites only, in the same Protein_Site format
+  Rs = Rs[ORGANISM == "human" & grepl("-p$", MOD_RSD)]
+  Rs = Rs[, which(colSums(!is.na(Rs)) > 0), with = FALSE]   # remove empty columns
+  Rs[, Protein_Site := paste0(ACC_ID, "_", sub("-p$", "", MOD_RSD))]
+
+  ## Merge: all sites (with annotation where available), and regulatory sites only
+  R_merge_full = merge(global.pairwiseComparison, Rs, by = "Protein_Site", all.x = TRUE)
+  R_merge = R_merge_full[!is.na(ACC_ID)]
+  R_merge[, flag_sig := significance != "Not Significant"]
+  simple_cols = c("Label", "Protein_Site", "Uniprot", "GeneName_Site", "GeneName", "log2FC", "pvalue", "adj.pvalue",
+                  "significance", "flag_sig", "PROT_TYPE", "ON_FUNCTION", "ON_PROCESS", "ON_PROT_INTERACT",
+                  "ON_OTHER_INTERACT", "NOTES", "PMIDs", "MS_LIT", "LT_LIT")
+  R_merge_simple = R_merge[, intersect(simple_cols, names(R_merge)), with = FALSE]
+  message(uniqueN(R_merge$Protein_Site), " of ", uniqueN(global.pairwiseComparison$Protein_Site), " sites are PhosphoSitePlus regulatory sites (",
+          uniqueN(R_merge$Protein_Site[R_merge$flag_sig]), " significant in at least one comparison)")
+
+  ## Save tables
+  fwrite(R_merge,        file.path(results_dir, "GroupComparisonsData_PhosphoSitePlus.csv"))
+  fwrite(R_merge_simple, file.path(results_dir, "GroupComparisonsData_PhosphoSitePlus_simple.csv"))
+  fwrite(R_merge_full,   file.path(results_dir, "GroupComparisonsData_PhosphoSitePlus_full.csv"))
+
+  ## Heatmap of log2FC per site (rows: gene_site--function); black boxes = adj.p <= adjp_cutoff
+  site_heatmap = function(R, file, title){
+    R = copy(R)[, Key := paste0(GeneName_Site, "--", ON_FUNCTION)]
+    if (uniqueN(R$Key) < 2) return(message("Fewer than 2 sites for '", title, "'; skipping heatmap"))
+    mat = as.matrix(dcast(R, Key ~ Label, value.var = "log2FC",     fun.aggregate = function(x) x[1]), rownames = "Key")
+    sig = as.matrix(dcast(R, Key ~ Label, value.var = "adj.pvalue", fun.aggregate = function(x) x[1]), rownames = "Key") <= adjp_cutoff
+    mat[is.infinite(mat)] = 5 * sign(mat[is.infinite(mat)])   # +/-Inf shown as +/-5
+    mat[is.na(mat)] = 0
+    sig[is.na(sig)] = FALSE
+    hm = Heatmap(mat, name = "Log2FC", column_title = title, border = TRUE,
+                 cluster_columns = ncol(mat) > 1, cluster_rows = nrow(mat) > 1,
+                 row_names_gp = gpar(fontsize = 8), row_names_max_width = unit(15, "cm"),
+                 cell_fun = function(j, i, x, y, width, height, fill){
+                   if (sig[i, j]) grid.rect(x, y, width, height, gp = gpar(col = "black", lwd = 1.5, fill = NA))
+                 })
+    draw(hm)
+    pdf(file.path(fig_dir, file), width = 10, height = max(5, 0.15 * nrow(mat) + 2), useDingbats = FALSE)
+    draw(hm)
+    dev.off()
+  }
+
+  # 1) Regulatory sites significant in at least one comparison
+  site_heatmap(R_merge_simple[Protein_Site %in% Protein_Site[flag_sig]],
+               "DA_heatmap_sites_PhosphoSitePlus.pdf", "Significant regulatory sites")
+
+  # 2) Regulatory sites on kinases (kinase list built into BouQuet)
+  is_kinase = R_merge_simple$GeneName %in% fread(bouquet_file("human_kinases.txt"))$Kinase
+  site_heatmap(R_merge_simple[is_kinase & !is.na(ON_FUNCTION) & ON_FUNCTION != ""],
+               "DA_heatmap_sites_PhosphoSitePlus_Kinase.pdf", "Regulatory sites on kinases")
+}
+
+```
+
+
+
+
+<!-- # Record of databases used in this analysis -->
+<!-- ```{r} -->
+<!-- # Show every database used in this analysis, with its source and date (results/database_versions.tsv) -->
+<!-- if (file.exists(file.path(results_dir, "database_versions.tsv"))) fread(file.path(results_dir, "database_versions.tsv")) -->
+<!-- ``` -->

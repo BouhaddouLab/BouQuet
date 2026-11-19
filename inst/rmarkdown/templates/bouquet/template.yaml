@@ -1,0 +1,5 @@
+name: BouQuet proteomics analysis
+description: >
+  Bouhaddou Lab notebook for Spectronaut data: QC, MSstats, enrichment,
+  kinase activity and PhosphoSitePlus regulatory sites.
+create_dir: true

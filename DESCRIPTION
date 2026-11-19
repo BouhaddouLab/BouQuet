@@ -1,0 +1,45 @@
+Package: BouQuet
+Title: Bouhaddou Lab Quantitative Proteomics Toolkit
+Version: 4.0.0
+Authors@R: person("Bouhaddou Lab", role = c("aut", "cre"), email = "bouhaddoulab@gmail.com")
+Description: Post-search analysis of Spectronaut DIA proteomics data (protein abundance,
+    phosphorylation and ubiquitination): QC, MSstats quantification, pathway enrichment,
+    kinase activity and PhosphoSitePlus regulatory sites. Comes with an R Markdown notebook
+    template (File > New File > R Markdown > From Template > BouQuet).
+License: file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 4.1),
+    data.table,
+    dplyr,
+    ggplot2,
+    ggcorrplot,
+    patchwork,
+    ComplexHeatmap,
+    MSstats
+Imports:
+    circlize,
+    clusterProfiler,
+    ggrepel,
+    grid,
+    Matrix,
+    msigdbr,
+    parallel,
+    pbapply,
+    RColorBrewer,
+    rmarkdown,
+    stats,
+    stringr,
+    tidyr,
+    tools,
+    utils
+Suggests:
+    AnnotationDbi,
+    arrow,
+    biomaRt,
+    msigdbdf,
+    org.Hs.eg.db,
+    org.Mm.eg.db,
+    org.Rn.eg.db
+Additional_repositories: https://igordot.r-universe.dev
+biocViews: Proteomics, MassSpectrometry

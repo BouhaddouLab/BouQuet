@@ -1,5 +1,5 @@
 ---
-title: "BouQuet: Bouhaddou Lab Quantitative proteomics Toolkit"
+title: "BouQuet: BOUhaddouLab QUantitative protEomics Toolkit"
 author: "Bouhaddou Lab"
 date: "`r Sys.Date()`"
 output: html_notebook
@@ -7,30 +7,55 @@ output: html_notebook
 
 
 
-# PART A: Setup and Import
+#### PART A: Setup and Import
 
-### A1: Setup (the ONLY chunk you should need to edit)
+# A1: Setup (the ONLY chunk you should need to edit)
 ```{r setup}
 
-# ---- Edit these for each experiment ----
+# ================= OVERALL (used throughout) =================
 data_type      = "phospho"       # "abundance", "phospho" or "ubiquitin"
 species        = "human"         # "human", "mouse" or "rat"
 ptm_type       = "Phospho"       # PTM name as it appears in EG.ModifiedSequence, e.g. "Phospho" or "GlyGly"
+ptm_loc_prob   = 0.75            # localization probability cutoff for sites (QC in Part B, site-level quant in Part C)
+contrasts_file = "data/contrasts.txt"   # comparisons to make (Parts C and D)
+log2fc_cutoff  = 1               # |log2FC| >= 1 means 2-fold; significance calls in Parts C and D
+adjp_cutoff    = 0.05            # adjusted p-value cutoff; significance calls in Parts C and D
+db_refresh     = FALSE           # Online databases (UniProt gene names, OmniPath, ...) are downloaded the first time they are needed,
+                                 # then reused from the cache. TRUE = download fresh copies this run
 
+
+# ================= PART A: Setup and Import =================
 input_file     = "data/20251104_193535_SM19_PH_Report_filt.tsv"   # Spectronaut report (MSstats scheme)
-keys_file      = "data/keys.csv"           # created in A2 if it does not exist yet
-contrasts_file = "data/contrasts.txt"
+keys_file      = "data/keys.csv"           # created in A2 if it does not exist yet; can leave this if you want the script to create one for you that you will edit.
 
+
+# ================= PART B: Quality Control =================
+# No settings of its own; uses data_type, ptm_type and ptm_loc_prob from OVERALL
+
+
+# ================= PART C: MSstats =================
 qvalue_cutoff         = 0.01               # precursor FDR
-ptm_loc_prob          = 0.75               # localization probability cutoff for site-level quant
 msstats_normalization = "equalizeMedians"  # FALSE = no normalization (e.g. APEX experiments)
-log2fc_cutoff         = 1                  # |log2FC| >= 1 means 2-fold
-adjp_cutoff           = 0.05
-enrich_background     = "detected"         # enrichment background: "detected" or "database"
+PTM_analysis_type     = c("PTMSiteQuant", "PTMPeptideQuant")
+# Which PTM quantifications to run (phospho/ubiquitin only). Use one or both:
+#   "PTMSiteQuant"     - site-level quant, highly localized sites only (faster)
+#   "PTMPeptideQuant"  - peptide-level quant, site agnostic (slower, uses more data, good for GSOA)
 
-db_refresh = FALSE   # Online databases (UniProt gene names, OmniPath, ...) are downloaded the first time they are needed,
-                     # then reused from the cache. TRUE = download fresh copies this run
-psp_file   = NULL    # PhosphoSitePlus Regulatory_sites file; NULL = newest in resources/, then the cache, then the copy built into BouQuet
+
+# ================= PART D: Differential Abundance (DA) Analyses =================
+# Which analyses to run (TRUE/FALSE)
+basic_DA_plots           = TRUE   # D1: volcano plots, bar plot of significant changes, CVs
+gsoa_analysis            = TRUE   # D2: GO biological process and canonical pathway over-representation
+kinase_activity_analysis = TRUE   # D3: kinase activity from OmniPath kinase-substrate network (phospho + PTMSiteQuant only)
+kinase_library_analysis  = TRUE   # D4: kinase activity from The Kinase Library motifs (phospho + PTMSiteQuant only; needs one-time Python setup, see D4)
+kl_proteome_file         = NULL   # D4 Optional UniProt proteome FASTA for site sequences, e.g. "data/uniprot_human_2025_01.fasta"; If NULL = UniProt reference proteome for `species`, downloaded once and cached (human, mouse or rat)
+PhosphoSitePlus_analysis = TRUE   # D5: PhosphoSitePlus regulatory sites (phospho + PTMSiteQuant only)
+
+# Analysis options
+enrich_background = "detected"   # D2 enrichment background: "detected" or "database"
+psp_file          = NULL         # D5 PhosphoSitePlus Regulatory_sites file; NULL = newest in resources/, then the cache, then the copy built into BouQuet
+
+
 
 
 # ---------------- Nothing below here needs editing ----------------
@@ -51,8 +76,16 @@ options(ptm.db_dir = tools::R_user_dir("BouQuet", which = "cache"), ptm.db_refre
 # Word used in plot labels
 what = c(abundance = "proteins", phospho = "phosphosites", ubiquitin = "ubiquitination sites")[[data_type]]
 
+# Quantification levels that were run in Part C; Part D makes plots/analyses for each one
+quant_types = if (data_type == "abundance") "ProteinQuant" else PTM_analysis_type
+
+# CPU cores for MSstats (Part C). Parallel MSstats only works on Mac/Linux, so Windows uses 1.
+# Capped at 4 to leave memory for the rest of the computer.
+n_cores = if (.Platform$OS.type == "windows") 1 else max(1, min(4, parallel::detectCores() - 1), na.rm = TRUE)
+
+
 ```
-### A2: Import data and create keys file
+# A2: Import data and create keys file
 ```{r}
   
 # Import data
@@ -80,7 +113,7 @@ if (!file.exists(keys_file)){
   
 
 ```
-### A3: Add keys, remove samples that do not pass QC, annotate ptm data
+# A3: Add keys, remove samples that do not pass QC, annotate ptm data
 ```{r}
 
 # To remove more samples later: change `Passed_QC` in the keys file and re-run from A1.
@@ -91,6 +124,10 @@ k <- match(input.report$R.FileName, keys$RawFile)
 input.report[, `:=`(R.Condition = keys$Condition[k],
                     R.Replicate = paste0(keys$Condition[k], ".", keys$BioReplicate[k]),
                     R.Passed_QC = keys$Passed_QC[k])]
+
+# Warn about runs in the report that are missing from the keys file (they are removed below)
+missing_runs = unique(input.report$R.FileName[is.na(k)])
+if (length(missing_runs) > 0) warning(length(missing_runs), " run(s) are not in ", keys_file, " and will be removed: ", paste(missing_runs, collapse = ", "))
 
 # Remove files that do not pass QC (and files missing from the keys file)
 input.report = input.report[R.Passed_QC == TRUE]
@@ -128,9 +165,9 @@ if (data_type == "phospho" | data_type == "ubiquitin"){
 
 
 
-# Part B: Quality Control (QC)
+#### Part B: Quality Control (QC)
 
-### B1: QC: peptide/protein counts, boxplots, correlations, and PCA
+# B1: QC: peptide/protein counts, boxplots, correlations, and PCA
 ```{r}
 plots <- list()   # collects every QC plot for the combined PDF
 
@@ -185,7 +222,7 @@ if (data_type == "abundance") {
 # PTM PROTEOMICS
 
   # Identified, quantified peptides per sample (one row per peptide per sample), flagged for carrying the PTM
-  ptm_rows <- unique(input.report[FG.Quantity > 0 & EG.Qvalue <= 0.01,
+  ptm_rows <- unique(input.report[FG.Quantity > 0 & EG.Qvalue <= qvalue_cutoff,
                                   .(R.Replicate, PEP.StrippedSequencePTM, PG.ProteinGroups, EG.PTMAssayProbability)])
   ptm_rows[, is_ptm := grepl(ptm_type, PEP.StrippedSequencePTM, fixed = TRUE)]
 
@@ -363,7 +400,7 @@ if (data_type == "abundance") {
   variance_explained <- variance / sum(variance)
   # Get data ready to plot
   pcaDT = as.data.table(pcaOut$x, keep.rownames=TRUE)
-  pcaDT$GROUP = gsub("\\..*","",pcaDT$rn)
+  pcaDT$GROUP = cond_map$R.Condition[match(pcaDT$rn, cond_map$R.Replicate)]   # works even if condition names contain "."
   pcaDT$RUN = gsub(".*\\.", "", pcaDT$rn)
   # Extract explained variance for PC1 and PC2
   explained_variance_pc1 <- round(variance_explained[1] * 100, 2)
@@ -402,214 +439,235 @@ if (data_type == "abundance") {
 ```
 
 
-# Part C: MSstats
 
-## C1: MSstats: AB Quant
+#### Part C: MSstats
+
+# C1: MSstats Quant (abundance, or PTM site + PTM peptide)
 ```{r}
 
-if (data_type == "abundance"){
-
-# FOR PROTEIN LEVEL AB QUANT
-# This performs quantification and comparisons at the protein level, using the protein groups (PG.ProteinGroups) as reported by Spectronaut.
-
-## PREPARE FOR MSSTATS
-global.prepared <- SpectronauttoMSstatsFormat(
-    input.report,
-    useUniquePeptide = TRUE,
-    filter_with_Qvalue = TRUE,
-    qvalue_cutoff = qvalue_cutoff,
-    removeProtein_with1Feature = FALSE,
-    removeFewMeasurements = FALSE,
-    use_log_file = FALSE)
-# Remove zero and missing intensities, and save the data into the results folder
-global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
-Save.Csv(global.prepared, "CleanedPreprocessedData_PeptideQuant.csv", results_dir)
-  
-
-## MSSTATS SUMMARIZATION AND NORMALIZATION
-global.proteinSummarization = MSstats::dataProcess(global.prepared,
-                                                   normalization = msstats_normalization,
-                                                   logTrans = 2,
-                                                   #featureSubset = 'highQuality',
-                                                   summaryMethod="TMP",
-                                                   censoredInt='NA',
-                                                   MBimpute=FALSE,
-                                                   maxQuantileforCensored=0.999)
-# Save the feature level data and the protein level data into seperate files in the results folder
-Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_PeptideQuant.csv", results_dir)
-Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_PeptideQuant.csv", results_dir)
-
-
-## MSSTATS GROUP COMPARISONS
-#Load in the Contrast File
+## LOAD CONTRASTS (shared by all quant types)
+# makes the condition comparisons from the contrast file available to every block below
 global.regexContrasts <- fread(contrasts_file, header = FALSE, blank.lines.skip = T)
 global.regexContrasts <- t(global.regexContrasts)
-# makes an MsStats-compatible contrast matrix using the condition comparisons in the parameter block
-contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
-                                            condition.vector = global.regexContrasts)
-global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization)$ComparisonResult
-# Save the global pairwise comparisons in the results folder
-Save.Csv(global.pairwiseComparison, "GroupComparisonsData_PeptideQuant.csv", results_dir)
+
+
+if (data_type == "abundance") {
+
+  ############################################################
+  ## AB QUANT (protein level)
+  ############################################################
+  # This performs quantification and comparisons at the protein level, using the protein groups (PG.ProteinGroups) as reported by Spectronaut.
+
+  ## PREPARE FOR MSSTATS
+  global.prepared <- SpectronauttoMSstatsFormat(
+      input.report,
+      useUniquePeptide = TRUE,
+      filter_with_Qvalue = TRUE,
+      qvalue_cutoff = qvalue_cutoff,
+      removeProtein_with1Feature = FALSE,
+      removeFewMeasurements = FALSE,
+      use_log_file = FALSE)
+  # Remove zero and missing intensities, and save the data into the results folder
+  global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
+  Save.Csv(global.prepared, "CleanedPreprocessedData_ProteinQuant.csv", results_dir)
+
+  ## MSSTATS SUMMARIZATION AND NORMALIZATION
+  global.proteinSummarization = MSstats::dataProcess(global.prepared,
+                                                     normalization = msstats_normalization,
+                                                     logTrans = 2,
+                                                     #featureSubset = 'highQuality',
+                                                     summaryMethod="TMP",
+                                                     censoredInt='NA',
+                                                     MBimpute=FALSE,
+                                                     maxQuantileforCensored=0.999,
+                                                     use_log_file = FALSE,
+                                                     numberOfCores = n_cores)
+  # Convert Uniprot IDs to Gene Symbols (keep only the first protein in each group)
+  global.proteinSummarization$FeatureLevelData$GeneName <- convert_geneids(gsub(";.*", "", global.proteinSummarization$FeatureLevelData$PROTEIN), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+  global.proteinSummarization$ProteinLevelData$GeneName <- convert_geneids(gsub(";.*", "", global.proteinSummarization$ProteinLevelData$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+  # Save the feature level data and the protein level data into separate files in the results folder
+  Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_ProteinQuant.csv", results_dir)
+  Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_ProteinQuant.csv", results_dir)
+
+  ## MSSTATS GROUP COMPARISONS
+  contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
+                                              condition.vector = global.regexContrasts)
+  global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization, use_log_file = FALSE,
+                                                          save_fitted_models = FALSE, numberOfCores = n_cores)$ComparisonResult
+  # Convert Uniprot IDs to Gene Symbols
+  global.pairwiseComparison$GeneName <- convert_geneids(gsub(";.*", "", global.pairwiseComparison$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+  # Annotate significance
+  global.pairwiseComparison <- global.pairwiseComparison %>%
+    mutate(significance = case_when(
+      log2FC ==  Inf                                       ~ "Inf Upregulated",
+      log2FC == -Inf                                       ~ "Inf Downregulated",
+      log2FC >=  log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Upregulated",
+      log2FC <= -log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Downregulated",
+      .default = "Not Significant"))
+  # Save the global pairwise comparisons in the results folder
+  Save.Csv(global.pairwiseComparison, "GroupComparisonsData_ProteinQuant.csv", results_dir)
+
+
+} else if (data_type %in% c("phospho", "ubiquitin")) {
+
+  # Check which PTM analyses to run (set PTM_analysis_type in the setup chunk)
+  valid_ptm_types <- c("PTMSiteQuant", "PTMPeptideQuant")
+  bad_ptm_types <- setdiff(PTM_analysis_type, valid_ptm_types)
+  if (length(bad_ptm_types) > 0) {
+    stop("PTM_analysis_type has unrecognized value(s): ", paste(bad_ptm_types, collapse = ", "),
+         ". Use one or both of: ", paste(valid_ptm_types, collapse = ", "))
+  }
+  if (length(PTM_analysis_type) == 0) {
+    stop("PTM_analysis_type is empty. Set it to \"PTMSiteQuant\", \"PTMPeptideQuant\", or both.")
+  }
+
+  if ("PTMSiteQuant" %in% PTM_analysis_type) {
+
+    ############################################################
+    ## PTM SITE QUANT -- HIGHLY LOCALIZED ONLY
+    ############################################################
+    # This performs quantification and comparisons at the site level, using the PG.ProteinSites column for annotation.
+
+    ## PREPARE FOR MSSTATS
+    # Keep only peptides that carry the PTM, and only highly localized sites. Localization is very important to do when you are quantifying at the site level because if not you could be quantifying sites that are not well localized and represent essentially made up data!
+    input.report.ptm = input.report[input.report$EG.PTMAssayProbability >= ptm_loc_prob &
+                                    grepl(ptm_type, input.report$EG.ModifiedSequence, fixed = TRUE), ]
+    # Define input
+    input.report.ptm$PG.ProteinGroups = input.report.ptm$PG.ProteinSites
+    # Run MSstats formatting
+    global.prepared <- suppressWarnings(SpectronauttoMSstatsFormat(
+        input.report.ptm,
+        useUniquePeptide = TRUE,
+        filter_with_Qvalue = TRUE,
+        qvalue_cutoff = qvalue_cutoff,
+        removeProtein_with1Feature = FALSE,
+        removeFewMeasurements = FALSE,
+        use_log_file = FALSE))
+    # Free memory
+    rm(input.report.ptm)
+    # Remove zero and missing intensities, and save the data into the results folder
+    global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
+    Save.Csv(global.prepared, "CleanedPreprocessedData_PTMSiteQuant.csv", results_dir)
+
+    ## MSSTATS SUMMARIZATION AND NORMALIZATION
+    global.proteinSummarization = MSstats::dataProcess(global.prepared,
+                                                       normalization = msstats_normalization,
+                                                       logTrans = 2,
+                                                       #featureSubset = 'highQuality',
+                                                       summaryMethod="TMP",
+                                                       censoredInt='NA',
+                                                       MBimpute=FALSE,
+                                                       maxQuantileforCensored=0.999,
+                                                       use_log_file = FALSE,
+                                                       numberOfCores = n_cores)
+    # Convert Uniprot IDs to Gene Symbols (strip the site after "_" and any extra proteins after ";")
+    global.proteinSummarization$FeatureLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$FeatureLevelData$PROTEIN), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+    global.proteinSummarization$ProteinLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$ProteinLevelData$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+    # Save the feature level data and the protein level data into separate files in the results folder
+    Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_PTMSiteQuant.csv", results_dir)
+    Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_PTMSiteQuant.csv", results_dir)
+
+    ## MSSTATS GROUP COMPARISONS
+    contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
+                                                condition.vector = global.regexContrasts)
+    global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization, use_log_file = FALSE,
+                                                          save_fitted_models = FALSE, numberOfCores = n_cores)$ComparisonResult
+    # Convert Uniprot IDs to Gene Symbols
+    global.pairwiseComparison$GeneName <- convert_geneids(gsub("[_;].*", "", global.pairwiseComparison$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+    # Annotate significance
+    global.pairwiseComparison <- global.pairwiseComparison %>%
+      mutate(significance = case_when(
+        log2FC ==  Inf                                       ~ "Inf Upregulated",
+        log2FC == -Inf                                       ~ "Inf Downregulated",
+        log2FC >=  log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Upregulated",
+        log2FC <= -log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Downregulated",
+        .default = "Not Significant"))
+    # Save the global pairwise comparisons in the results folder
+    Save.Csv(global.pairwiseComparison, "GroupComparisonsData_PTMSiteQuant.csv", results_dir)
+
+  }
+
+
+  if ("PTMPeptideQuant" %in% PTM_analysis_type) {
+
+    ############################################################
+    ## PTM PEPTIDE QUANT (site agnostic)
+    ############################################################
+    # This performs quantification and comparisons at the phosphopeptide level (site agnostic) using the PEP.StrippedPeptidePTM column for annotation (Protein_StrippedPeptide_NumberofMods). This is useful for GSOA studies and uses more of your data.
+
+    ## PREPARE FOR MSSTATS
+    # Keep only peptides that carry the PTM (unmodified peptides would otherwise be quantified, tested and used in GSOA)
+    input.report.ptm = input.report[grepl(ptm_type, EG.ModifiedSequence, fixed = TRUE)]
+    input.report.ptm$PG.ProteinGroups = input.report.ptm$PEP.StrippedSequencePTM
+    global.prepared <- suppressWarnings(SpectronauttoMSstatsFormat(
+        input.report.ptm,
+        useUniquePeptide = TRUE,
+        filter_with_Qvalue = TRUE,
+        qvalue_cutoff = qvalue_cutoff,
+        removeProtein_with1Feature = FALSE,
+        removeFewMeasurements = FALSE,
+        use_log_file = FALSE))
+    # Free memory
+    rm(input.report.ptm)
+    # Remove zero and missing intensities, and save the data into the results folder
+    global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
+    Save.Csv(global.prepared, "CleanedPreprocessedData_PTMPeptideQuant.csv", results_dir)
+
+    ## MSSTATS SUMMARIZATION AND NORMALIZATION
+    global.proteinSummarization = MSstats::dataProcess(global.prepared,
+                                                       normalization = msstats_normalization,
+                                                       logTrans = 2,
+                                                       #featureSubset = 'highQuality',
+                                                       summaryMethod="TMP",
+                                                       censoredInt='NA',
+                                                       MBimpute=FALSE,
+                                                       maxQuantileforCensored=0.999,
+                                                       use_log_file = FALSE,
+                                                       numberOfCores = n_cores)
+    # Convert Uniprot IDs to Gene Symbols (strip the peptide after "_" and any extra proteins after ";")
+    global.proteinSummarization$FeatureLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$FeatureLevelData$PROTEIN), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+    global.proteinSummarization$ProteinLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$ProteinLevelData$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+    # Save the feature level data and the protein level data into separate files in the results folder
+    Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_PTMPeptideQuant.csv", results_dir)
+    Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_PTMPeptideQuant.csv", results_dir)
+
+    ## MSSTATS GROUP COMPARISONS
+    contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
+                                                condition.vector = global.regexContrasts)
+    global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization, use_log_file = FALSE,
+                                                          save_fitted_models = FALSE, numberOfCores = n_cores)$ComparisonResult
+    # Convert Uniprot IDs to Gene Symbols
+    global.pairwiseComparison$GeneName <- convert_geneids(gsub("[_;].*", "", global.pairwiseComparison$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
+    # Annotate significance
+    global.pairwiseComparison <- global.pairwiseComparison %>%
+      mutate(significance = case_when(
+        log2FC ==  Inf                                       ~ "Inf Upregulated",
+        log2FC == -Inf                                       ~ "Inf Downregulated",
+        log2FC >=  log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Upregulated",
+        log2FC <= -log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Downregulated",
+        .default = "Not Significant"))
+    # Save the global pairwise comparisons in the results folder
+    Save.Csv(global.pairwiseComparison, "GroupComparisonsData_PTMPeptideQuant.csv", results_dir)
+
+  }
 
 } else {
-  message("Your data type is not abundance")
+  message("data_type must be 'abundance', 'phospho', or 'ubiquitin'. You entered: ", data_type)
 }
 
 ```
-## C2: MSstats: PTM Site Quant
+
+
+
+#### Part D: Differential Abundance (DA) Analyses
+
+# D1: Basic DA plots: volcano plots, bar plots, heatmap, CVs
 ```{r}
 
-if (data_type == "phospho" | data_type == "ubiquitin"){
+if (!basic_DA_plots) message("Skipping basic DA plots (basic_DA_plots = FALSE)") else {
 
-# FOR SITE-LEVEL PTM QUANT -- HIGHLY LOCALIZED ONLY
-# This performs quantification and comparisons at the phosphopeptide level (site agnostic) using the PEP.StrippedPeptidePTM column for annotation (Protein_StrippedPeptide_NumberofMods). This is useful for GSOA studies and uses more of your data.
-
-## PREPARE FOR MSSTATS
-# Threshold for highly localized sites only, this is very important to do when you are quantifying at the site level becuase if not you could be quantifying sites that are not well localized and represent essentially made up data!
-input.report.ptm = input.report[input.report$EG.PTMAssayProbability >= ptm_loc_prob &
-                                grepl(ptm_type, input.report$EG.ModifiedSequence, fixed = TRUE), ]
-# Define input
-input.report.ptm$PG.ProteinGroups = input.report.ptm$PG.ProteinSites
-# Run MSstats formatting
-global.prepared <- suppressWarnings(SpectronauttoMSstatsFormat(
-    input.report.ptm,
-    useUniquePeptide = TRUE,
-    filter_with_Qvalue = TRUE,
-    qvalue_cutoff = qvalue_cutoff,
-    removeProtein_with1Feature = FALSE,
-    removeFewMeasurements = FALSE,
-    use_log_file = FALSE))
-# Free memory
-rm(input.report.ptm)
-# Remove zero and missing intensities, and save the data into the results folder
-global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
-Save.Csv(global.prepared, "CleanedPreprocessedData_PTMSiteQuant.csv", results_dir)
-  
-
-## MSSTATS SUMMARIZATION AND NORMALIZATION
-global.proteinSummarization = MSstats::dataProcess(global.prepared,
-                                                   normalization = msstats_normalization,
-                                                   logTrans = 2,
-                                                   #featureSubset = 'highQuality',
-                                                   summaryMethod="TMP",
-                                                   censoredInt='NA',
-                                                   MBimpute=FALSE,
-                                                   maxQuantileforCensored=0.999,
-                                                   use_log_file = FALSE)
-# Convert Uniprot IDs to Gene Symbols
-global.proteinSummarization$FeatureLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$FeatureLevelData$PROTEIN), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
-global.proteinSummarization$ProteinLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$ProteinLevelData$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
-# Save the feature level data and the protein level data into seperate files in the results folder
-Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_PTMSiteQuant.csv", results_dir)
-Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_PTMSiteQuant.csv", results_dir)
-
-
-## MSSTATS GROUP COMPARISONS
-#Load in the Contrast File
-global.regexContrasts <- fread(contrasts_file, header = FALSE, blank.lines.skip = T)
-global.regexContrasts <- t(global.regexContrasts)
-# makes an MsStats-compatible contrast matrix using the condition comparisons in the parameter block
-contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
-                                            condition.vector = global.regexContrasts)
-global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization, use_log_file = FALSE)$ComparisonResult
-# Convert Uniprot IDs to Gene Symbols
-global.pairwiseComparison$GeneName <- convert_geneids(gsub("[_;].*", "", global.pairwiseComparison$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
-# Annotate significance
-global.pairwiseComparison <- global.pairwiseComparison %>%
-  mutate(significance = case_when(
-    log2FC ==  Inf                                       ~ "Inf Upregulated",
-    log2FC == -Inf                                       ~ "Inf Downregulated",
-    log2FC >=  log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Upregulated",
-    log2FC <= -log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Downregulated",
-    .default = "Not Significant"))
-# Save the global pairwise comparisons in the results folder
-Save.Csv(global.pairwiseComparison, "GroupComparisonsData_PTMSiteQuant.csv", results_dir)
-
-} else {
-  message("Your data type is not phospho or ubiquitin")
-}
-
-```
-## C3: MSstats: PTM Peptide Quant
-```{r}
-
-if (data_type == "phospho" | data_type == "ubiquitin"){
-
-# FOR PEPTIDE PTM QUANT
-# This performs quantification and comparisons at the phosphopeptide level (site agnostic) using the PEP.StrippedPeptidePTM column for annotation (Protein_StrippedPeptide_NumberofMods). This is useful for GSOA studies and uses more of your data.
-
-## PREPARE FOR MSSTATS
-input.report.ptm = input.report
-input.report.ptm$PG.ProteinGroups = input.report.ptm$PEP.StrippedSequencePTM
-global.prepared <- suppressWarnings(SpectronauttoMSstatsFormat(
-    input.report.ptm,
-    useUniquePeptide = TRUE,
-    filter_with_Qvalue = TRUE,
-    qvalue_cutoff = qvalue_cutoff,
-    removeProtein_with1Feature = FALSE,
-    removeFewMeasurements = FALSE,
-    use_log_file = FALSE))
-# Free memory
-rm(input.report.ptm)
-# Remove zero and missing intensities, and save the data into the results folder
-global.prepared = global.prepared[!is.na(global.prepared$Intensity) & global.prepared$Intensity>0,]
-Save.Csv(global.prepared, "CleanedPreprocessedData_PeptideQuant.csv", results_dir)
-  
-
-## MSSTATS SUMMARIZATION AND NORMALIZATION
-global.proteinSummarization = MSstats::dataProcess(global.prepared,
-                                                   normalization = msstats_normalization,
-                                                   logTrans = 2,
-                                                   #featureSubset = 'highQuality',
-                                                   summaryMethod="TMP",
-                                                   censoredInt='NA',
-                                                   MBimpute=FALSE,
-                                                   maxQuantileforCensored=0.999)
-# Convert Uniprot IDs to Gene Symbols
-global.proteinSummarization$FeatureLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$FeatureLevelData$PROTEIN), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
-global.proteinSummarization$ProteinLevelData$GeneName <- convert_geneids(gsub("[_;].*", "", global.proteinSummarization$ProteinLevelData$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
-# Save the feature level data and the protein level data into seperate files in the results folder
-Save.Csv(global.proteinSummarization$FeatureLevelData, "FeatureLevelData_PeptideQuant.csv", results_dir)
-Save.Csv(global.proteinSummarization$ProteinLevelData, "ProteinLevelData_PeptideQuant.csv", results_dir)
-
-
-## MSSTATS GROUP COMPARISONS
-#Load in the Contrast File
-global.regexContrasts <- fread(contrasts_file, header = FALSE, blank.lines.skip = T)
-global.regexContrasts <- t(global.regexContrasts)
-# makes an MsStats-compatible contrast matrix using the condition comparisons in the parameter block
-contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization,
-                                            condition.vector = global.regexContrasts)
-global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization)$ComparisonResult
-# Convert Uniprot IDs to Gene Symbols
-global.pairwiseComparison$GeneName <- convert_geneids(gsub("[_;].*", "", global.pairwiseComparison$Protein), from_type = "UNIPROT", to_type = "SYMBOL", species = species)
-# Annotate significance
-global.pairwiseComparison <- global.pairwiseComparison %>%
-  mutate(significance = case_when(
-    log2FC ==  Inf                                       ~ "Inf Upregulated",
-    log2FC == -Inf                                       ~ "Inf Downregulated",
-    log2FC >=  log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Upregulated",
-    log2FC <= -log2fc_cutoff & adj.pvalue <= adjp_cutoff ~ "Downregulated",
-    .default = "Not Significant"))
-# Save the global pairwise comparisons in the results folder
-Save.Csv(global.pairwiseComparison, "GroupComparisonsData_PeptideQuant.csv", results_dir)
-
-} else {
-  message("Your data type is not phospho or ubiquitin")
-}
-
-```
-
-
-
-
-Part D: Differential Abundance (DA) Analyses
-
-### D1: Basic DA plots: volcano plots, bar plots, heatmap, CVs
-```{r}
-
-## Run everything below once per quantification level; each gets its own multi-page PDF
-for (quant_type in c("PTMSiteQuant", "PeptideQuant")) {
+## Run everything below once per quantification level (set in Setup); each gets its own multi-page PDF
+for (quant_type in quant_types) {
 
   plots <- list()   # collects every plot for this quant_type's combined PDF
 
@@ -642,7 +700,7 @@ for (quant_type in c("PTMSiteQuant", "PeptideQuant")) {
     # For all proteins with |Log2FC| < 1 and pval > 0.05, value is "Not"
     # For proteins with |Log2FC| >= 1 and pval <= 0.05, value is "Up" or "Down" as appropriate
     thisPairwiseComparison[, Significance := "Not"]
-    thisPairwiseComparison[adj.pvalue < p_num & abs(log2FC) > log2(l2_num),
+    thisPairwiseComparison[adj.pvalue <= p_num & abs(log2FC) >= log2(l2_num),
                            Significance := ifelse (log2FC > 0, "Up", "Down")]
 
     ## Render volcano plots
@@ -718,7 +776,7 @@ for (quant_type in c("PTMSiteQuant", "PeptideQuant")) {
   # Calculate the coefficient of variation distribution of each condition
   proteomics_data <- ProteinLevelData %>%
     group_by(GROUP,Protein) %>%
-    summarize(CV = sd(2^LogIntensities, na.rm = TRUE) / mean(2^LogIntensities, na.rm = TRUE) * 100)
+    summarize(CV = sd(2^LogIntensities, na.rm = TRUE) / mean(2^LogIntensities, na.rm = TRUE) * 100, .groups = "drop")
 
   # Median CV per group, for the text labels
   median_CVs <- proteomics_data %>%
@@ -744,32 +802,37 @@ for (quant_type in c("PTMSiteQuant", "PeptideQuant")) {
   dev.off()
 }
 
+}
 
 ```
-### D2: Gene Set Over-representation Analysis (GSOA): C5 (GO biological process) and C2 (canonical pathways) GSOA
+# D2: Gene Set Over-representation Analysis (GSOA): C5 (GO biological process) and C2 (canonical pathways) GSOA
 ```{r}
 
-# Gene-set databases: fetched once, reused for both quantification levels
+if (!gsoa_analysis) message("Skipping GSOA (gsoa_analysis = FALSE)") else {
+
+# Gene-set databases: fetched once, reused for every quantification level
 dbs = list(GOBP     = list(gmt = get_msigdb("C5", "GO:BP"), width = 10, height = 10),
            pathways = list(gmt = get_msigdb("C2", "CP"),    width = 9,  height = 5.5))
 
-for (quant in c("PeptideQuant", "PTMSiteQuant")){
-  
-  # Load and threshold the group comparisons
-  global.pairwiseComparison = fread(file.path(results_dir, paste0("GroupComparisonsData_", quant, ".csv")))
+for (quant in quant_types){
+
+  # Load and threshold the group comparisons (skip this quant level if it was not run)
+  gc_file = file.path(results_dir, paste0("GroupComparisonsData_", quant, ".csv"))
+  if (!file.exists(gc_file)) { message("Missing ", gc_file, "; skipping GSOA for ", quant); next }
+  global.pairwiseComparison = fread(gc_file)
   M = unique(global.pairwiseComparison[abs(log2FC) >= log2fc_cutoff & adj.pvalue <= adjp_cutoff &
                                          is.finite(log2FC) & !is.na(GeneName),   # removes Inf values from enrichment
                                        .(genes = GeneName, group = Label)])
-  
+
   # Background genes: NULL = all genes in the gene-set database, or all detected genes
   background = if (enrich_background == "detected") unique(na.omit(global.pairwiseComparison$GeneName)) else NULL
-  
+
   for (db in names(dbs)){
     enrich_table = do_enrichmap(M, cutHeight = 0, topN = 10, flag_cluster_col = TRUE, flag_p = FALSE,
                                 database_in = dbs[[db]]$gmt,
                                 column_order_values = NULL, minGSSize = 10, allGenes = background)
     fwrite(enrich_table[[1]], file = file.path(results_dir, paste0("DA_enrichment_table_", db, "_", quant, ".txt")), sep = "\t")
-    
+
     # Heatmap (skipped when fewer than 2 terms were enriched)
     if (!is.null(enrich_table[[2]])){
       pdf(file = file.path(fig_dir, paste0("DA_enrichment_heatmap_", db, "_", quant, ".pdf")),
@@ -780,17 +843,27 @@ for (quant in c("PeptideQuant", "PTMSiteQuant")){
   }
 }
 
+}
+
 ```
-### D3: Kinase activity analysis with OmniPath (prior-knowledge network)
+# D3: Kinase activity analysis with OmniPath (prior-knowledge network)
 ```{r}
 
-if (data_type != "phospho") message("Skipping kinase activity (phospho only)") else {
+site_file = file.path(results_dir, "GroupComparisonsData_PTMSiteQuant.csv")
+
+if (!kinase_activity_analysis) {
+  message("Skipping OmniPath kinase activity (kinase_activity_analysis = FALSE)")
+} else if (data_type != "phospho") {
+  message("Skipping OmniPath kinase activity (phospho only)")
+} else if (!file.exists(site_file)) {
+  message("Skipping OmniPath kinase activity: it needs PTMSiteQuant results (add \"PTMSiteQuant\" to PTM_analysis_type)")
+} else {
 
 # Load global.pairwiseComparison
-global.pairwiseComparison = fread(file.path(results_dir, paste0("GroupComparisonsData_PTMSiteQuant.csv")))
+global.pairwiseComparison = fread(site_file)
 
-# Remove double sites and abiguous sites
-global.pairwiseComparison = global.pairwiseComparison[!grepl("_[A-Z][0-9]+_", global.pairwiseComparison$Protein) & !grepl("|", global.pairwiseComparison$Protein, fixed = TRUE) & !grepl(";", global.pairwiseComparison$Protein, fixed = TRUE), ]
+# Keep single, unambiguous sites (e.g. P31749_S473): remove double sites, ambiguous sites and rows without a site
+global.pairwiseComparison = global.pairwiseComparison[grepl("_", Protein, fixed = TRUE) & !grepl("_[A-Z][0-9]+_", Protein) & !grepl("|", Protein, fixed = TRUE) & !grepl(";", Protein, fixed = TRUE)]
 
 # Prepare input
 global.pairwiseComparison$Uniprot = gsub("_.*","",global.pairwiseComparison$Protein)
@@ -802,7 +875,7 @@ colnames(log2FCData) = c("group","log2FC","Protein","uniprot","pos","aa")
 
 # Do kinase activity analysis (OmniPath network: downloaded the first time, then reused unless db_refresh = TRUE;
 # writes kinaseSummaryScores.txt)
-do_KinaseActivity_Network(log2FCData,kinaseDataSource="Omnipath", out_dir = results_dir, refreshOmnipath = db_refresh)
+do_KinaseActivity_Network(log2FCData,kinaseDataSource="Omnipath", species = species, out_dir = results_dir, refreshOmnipath = db_refresh)
 
 # Import kinase activity data and select top hits for heatmap (p <= 0.05 in at least one comparison)
 K = fread(file.path(results_dir, "kinaseSummaryScores.txt"))
@@ -832,27 +905,154 @@ if (nrow(mat.in) < 2) message("Fewer than 2 significant kinases; skipping heatma
 }
 
 ```
-### D4: Integrate functional impacts of specific phosphorylation sites (Regulatory Sites from PhosphoSitePlus)
+# D4: Kinase activity analysis with The Kinase Library (substrate motifs)
+```{r}
+
+# For each comparison, sites are called up, down or unchanged using the same cutoffs as everywhere else (log2fc_cutoff, adjp_cutoff).
+# Each site's +/-7 amino-acid sequence is scored against the motif of every kinase. A site counts as a kinase's putative substrate
+# if that kinase ranks in the site's top 15 (Ser/Thr) or top 8 (Tyr). A Fisher's exact test then asks whether a kinase's substrates
+# are over-represented among up- or down-regulated sites, compared with unchanged sites.
+# Input: the same site-level log2FC and adj.pvalue as D3 (single, unambiguous sites from PTMSiteQuant).
+# Uses the kinase-library Python package. Please cite Johnson et al. 2023 Nature (Ser/Thr) and Yaron-Barir et al. 2024 Nature (Tyr).
+#
+# ONE-TIME SETUP on each computer (run in the R console, not in this notebook):
+#   install.packages("reticulate")
+#   py <- reticulate::install_python("3.11:latest")
+#   reticulate::virtualenv_create("kinase-library", python = py, packages = "kinase-library")
+# Site sequences come from kl_proteome_file (Setup) if set. If it is NULL, the first run downloads the UniProt reference proteome
+# for `species` (~100 MB) into the BouQuet database cache, then reuses it (re-downloaded when db_refresh = TRUE).
+# The UniProt release used is recorded in a .release.txt file next to it.
+
+kl_python_env = "kinase-library"   # name of the Python environment made in the one-time setup
+kl_st_rank    = 15                 # Ser/Thr: kinase must rank in a site's top 15 (Kinase Library default)
+kl_y_rank     = 8                  # Tyr: kinase must rank in a site's top 8 (Kinase Library default)
+
+site_file = file.path(results_dir, "GroupComparisonsData_PTMSiteQuant.csv")
+
+if (!kinase_library_analysis) {
+  message("Skipping Kinase Library analysis (kinase_library_analysis = FALSE)")
+} else if (data_type != "phospho") {
+  message("Skipping Kinase Library analysis (phospho only)")
+} else if (!file.exists(site_file)) {
+  message("Skipping Kinase Library analysis: it needs PTMSiteQuant results (add \"PTMSiteQuant\" to PTM_analysis_type)")
+} else if (!requireNamespace("reticulate", quietly = TRUE) || !reticulate::virtualenv_exists(kl_python_env)) {
+  message("Skipping Kinase Library analysis: the Python environment '", kl_python_env, "' was not found. ",
+          "See ONE-TIME SETUP at the top of this chunk.")
+} else {
+
+## Load the kinase-library Python package
+reticulate::use_virtualenv(kl_python_env, required = TRUE)
+kl = reticulate::import("kinase_library")
+
+## Same input as D3: single, unambiguous sites (e.g. P31749_S473)
+global.pairwiseComparison = fread(site_file)
+global.pairwiseComparison = global.pairwiseComparison[grepl("_", Protein, fixed = TRUE) & !grepl("_[A-Z][0-9]+_", Protein) & !grepl("|", Protein, fixed = TRUE) & !grepl(";", Protein, fixed = TRUE)]
+global.pairwiseComparison[, `:=`(Uniprot = sub("_.*", "", Protein), Site = sub(".*_", "", Protein))]
+
+## Get each site's +/-7 amino-acid sequence from a UniProt proteome FASTA:
+##   kl_proteome_file set in Setup -> use that file
+##   kl_proteome_file = NULL       -> the UniProt reference proteome for `species`, downloaded once into the BouQuet cache
+if (!is.null(kl_proteome_file)) {
+  if (!file.exists(kl_proteome_file)) stop("kl_proteome_file not found: ", kl_proteome_file)
+  proteome_fasta = normalizePath(kl_proteome_file)
+} else {
+  kl_dir = file.path(db_dir(), "kinase_library")
+  dir.create(kl_dir, showWarnings = FALSE, recursive = TRUE)
+  proteome_fasta = file.path(kl_dir, paste0(species, "_uniprot_proteome_with_isoforms.fasta"))
+  if (db_refresh || !file.exists(proteome_fasta)) proteome_fasta = kl$download_proteome(species, dest_dir = kl_dir, overwrite = TRUE)
+}
+message("Kinase Library: site sequences from ", proteome_fasta)
+
+sites = unique(global.pairwiseComparison[, .(Uniprot, Site)])
+seqs = kl$retrieve_sequences(as.data.frame(sites), protein_column = "Uniprot", pos_column = "Site", ref_prot_file = proteome_fasta)
+windows = as.data.table(seqs[[1]])[!is.na(`SITE_+/-7_AA`) & `SITE_+/-7_AA` != ""]
+unresolved = as.data.table(seqs[[2]])
+if (nrow(unresolved) > 0) {
+  message(nrow(unresolved), " of ", nrow(sites), " sites could not be matched to a UniProt sequence; see DA_KinaseLibrary_unresolved_sites.txt")
+  fwrite(unresolved, file.path(results_dir, "DA_KinaseLibrary_unresolved_sites.txt"), sep = "\t")
+}
+
+## Add sequences; drop Inf log2FC (no p-value) and missing p-values
+kl_input = merge(global.pairwiseComparison, windows[, .(Uniprot, Site, `SITE_+/-7_AA`)], by = c("Uniprot", "Site"))
+kl_input = kl_input[is.finite(log2FC) & !is.na(adj.pvalue)]
+
+## Run the enrichment for each comparison: Ser/Thr kinases on S/T sites, Tyr kinases on Y sites
+kin_types = list(ser_thr = kl_st_rank, tyrosine = kl_y_rank)
+KL = list()
+for (comparison in unique(kl_input$Label)) {
+  dp = kl$DiffPhosData(as.data.frame(kl_input[Label == comparison, .(Protein, Label, log2FC, adj.pvalue, `SITE_+/-7_AA`)]),
+                       lfc_col = "log2FC", lfc_thresh = log2fc_cutoff,
+                       pval_col = "adj.pvalue", pval_thresh = adjp_cutoff,
+                       seq_col = "SITE_+/-7_AA", suppress_warnings = TRUE)
+  for (kt in names(kin_types)) {
+    res = tryCatch(dp$kinase_enrichment(kin_type = kt, kl_method = "percentile_rank", kl_thresh = as.integer(kin_types[[kt]])),
+                   error = function(e){ message("Kinase Library (", kt, ", ", comparison, ") failed: ", conditionMessage(e)); NULL })
+    if (is.null(res)) next
+    tab = as.data.frame(res$combined_enrichment_results)
+    KL[[length(KL) + 1]] = data.table(Label = comparison, kin_type = kt, kinase = rownames(tab), tab)
+  }
+}
+KL = rbindlist(KL)
+
+## Save the full table. most_sig_log2_freq_factor: > 0 = enriched among upregulated sites (activated), < 0 = among downregulated (inhibited)
+fwrite(KL, file.path(results_dir, "DA_KinaseLibrary_enrichment.txt"), sep = "\t")
+
+## Heatmap: kinases with adj.p <= adjp_cutoff in at least one comparison; black boxes = significant
+KL[, Key := ifelse(kin_type == "tyrosine", paste0(kinase, " (Y)"), kinase)]
+sig_keys = KL[most_sig_fisher_adj_pval <= adjp_cutoff, unique(Key)]
+if (length(sig_keys) < 2) message("Fewer than 2 significant kinases in the Kinase Library analysis; skipping heatmap") else {
+  KL_sig = KL[Key %in% sig_keys]
+  mat = as.matrix(dcast(KL_sig, Key ~ Label, value.var = "most_sig_log2_freq_factor"), rownames = "Key")
+  sig = as.matrix(dcast(KL_sig, Key ~ Label, value.var = "most_sig_fisher_adj_pval"), rownames = "Key") <= adjp_cutoff
+  if (any(is.infinite(mat))) mat[is.infinite(mat)] = sign(mat[is.infinite(mat)]) * max(abs(mat[is.finite(mat)]), na.rm = TRUE)   # cap +/-Inf
+  mat[is.na(mat)] = 0
+  sig[is.na(sig)] = FALSE
+  row_type = ifelse(grepl(" \\(Y\\)$", rownames(mat)), "Tyr kinases", "Ser/Thr kinases")
+  h = Heatmap(mat, name = "Log2 freq.\nfactor", column_title = "The Kinase Library",
+              row_split = if (length(unique(row_type)) > 1) row_type else NULL,
+              clustering_method_rows = "ward.D2",
+              cluster_rows = nrow(mat) > 1, cluster_columns = ncol(mat) > 1,
+              cell_fun = function(j, i, x, y, width, height, fill){
+                if (sig[i, j]) grid.rect(x = x, y = y, width = width, height = height, gp = gpar(col = "black", lwd = 0.7, fill = NA))
+              })
+  draw(h)
+  pdf(file = file.path(fig_dir, "DA_KinaseLibrary_heatmap.pdf"), width = 5, height = max(5, 0.15 * nrow(mat) + 2))
+  draw(h)
+  dev.off()
+}
+
+}
+
+```
+# D5: Integrate functional impacts of specific phosphorylation sites (Regulatory Sites from PhosphoSitePlus)
 ```{r}
 
 ## Load PhosphoSitePlus Regulatory_sites: the file set as psp_file in Setup, otherwise the newest "Regulatory_sites..."
 ## file in resources/, then in the database cache folder, then the copy built into BouQuet
+site_file = file.path(results_dir, "GroupComparisonsData_PTMSiteQuant.csv")
 Rs = NULL
-if (data_type != "phospho") message("Skipping PhosphoSitePlus (phospho only)") else
+if (!PhosphoSitePlus_analysis) {
+  message("Skipping PhosphoSitePlus (PhosphoSitePlus_analysis = FALSE)")
+} else if (data_type != "phospho") {
+  message("Skipping PhosphoSitePlus (phospho only)")
+} else if (!file.exists(site_file)) {
+  message("Skipping PhosphoSitePlus: it needs PTMSiteQuant results (add \"PTMSiteQuant\" to PTM_analysis_type)")
+} else {
   Rs = tryCatch(get_psp_regulatory_sites(), error = function(e){ message(conditionMessage(e)); NULL })
+}
 
 if (!is.null(Rs)) {
 
   ## Site-level group comparisons: keep single, unambiguous sites on one protein (e.g. P31749_S473)
-  global.pairwiseComparison = fread(file.path(results_dir, "GroupComparisonsData_PTMSiteQuant.csv"))
+  global.pairwiseComparison = fread(site_file)
   global.pairwiseComparison = global.pairwiseComparison[grepl("_", Protein, fixed = TRUE) & !grepl("_[A-Z][0-9]+_", Protein) &
                                                        !grepl("|", Protein, fixed = TRUE) & !grepl(";", Protein, fixed = TRUE)]
   global.pairwiseComparison[, `:=`(Protein_Site  = Protein,
                                    Uniprot       = sub("_.*", "", Protein),
                                    GeneName_Site = paste0(GeneName, "_", sub(".*_", "", Protein)))]
 
-  ## PhosphoSitePlus: human phosphosites only, in the same Protein_Site format
-  Rs = Rs[ORGANISM == "human" & grepl("-p$", MOD_RSD)]
+  ## PhosphoSitePlus: phosphosites for this species only, in the same Protein_Site format
+  Rs = Rs[ORGANISM == tolower(species) & grepl("-p$", MOD_RSD)]
   Rs = Rs[, which(colSums(!is.na(Rs)) > 0), with = FALSE]   # remove empty columns
   Rs[, Protein_Site := paste0(ACC_ID, "_", sub("-p$", "", MOD_RSD))]
 
@@ -898,7 +1098,7 @@ if (!is.null(Rs)) {
                "DA_heatmap_sites_PhosphoSitePlus.pdf", "Significant regulatory sites")
 
   # 2) Regulatory sites on kinases (kinase list built into BouQuet)
-  is_kinase = R_merge_simple$GeneName %in% fread(bouquet_file("human_kinases.txt"))$Kinase
+  is_kinase = toupper(R_merge_simple$GeneName) %in% toupper(fread(bouquet_file("human_kinases.txt"))$Kinase)   # toupper: mouse/rat symbols are e.g. "Akt1"
   site_heatmap(R_merge_simple[is_kinase & !is.na(ON_FUNCTION) & ON_FUNCTION != ""],
                "DA_heatmap_sites_PhosphoSitePlus_Kinase.pdf", "Regulatory sites on kinases")
 }
@@ -907,9 +1107,10 @@ if (!is.null(Rs)) {
 
 
 
+#### Part E: Post-Run Operations
 
-<!-- # Record of databases used in this analysis -->
-<!-- ```{r} -->
-<!-- # Show every database used in this analysis, with its source and date (results/database_versions.tsv) -->
-<!-- if (file.exists(file.path(results_dir, "database_versions.tsv"))) fread(file.path(results_dir, "database_versions.tsv")) -->
-<!-- ``` -->
+# E1: Record of databases used in this analysis
+```{r}
+# Show every database used in this analysis, with its source and date (results/database_versions.tsv)
+if (file.exists(file.path(results_dir, "database_versions.tsv"))) fread(file.path(results_dir, "database_versions.tsv"))
+```

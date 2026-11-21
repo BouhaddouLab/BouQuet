@@ -1,6 +1,6 @@
 Package: BouQuet
 Title: Bouhaddou Lab Quantitative Proteomics Toolkit
-Version: 4.0.0
+Version: 4.1.0
 Authors@R: person("Bouhaddou Lab", role = c("aut", "cre"), email = "bouhaddoulab@gmail.com")
 Description: Post-search analysis of Spectronaut DIA proteomics data (protein abundance,
     phosphorylation and ubiquitination): QC, MSstats quantification, pathway enrichment,

@@ -889,18 +889,26 @@ K.wide.p.filt = K.wide.p[inds,]
 mat.in = as.matrix(K.wide.filt[,2:ncol(K.wide.filt)], rownames=K.wide.filt$CTRL_GENE_NAME)
 mat.in.p = as.matrix(K.wide.p.filt[,2:ncol(K.wide.p.filt)], rownames=K.wide.p.filt$CTRL_GENE_NAME)<=0.05
 mat.in.p[is.na(mat.in.p)] = FALSE
+
 if (nrow(mat.in) < 2) message("Fewer than 2 significant kinases; skipping heatmap") else {
-  h = Heatmap(mat.in, name = "Kinase Activity", clustering_method_rows = "ward.D2",
-              cluster_columns = ncol(mat.in) > 1,
+  # Cluster on a copy with missing scores set to 0 (clustering cannot handle NA),
+  # but plot the real scores, so kinases not scored in a comparison show as grey
+  mat.cl = mat.in
+  mat.cl[is.na(mat.cl)] = 0
+  row_hc = hclust(dist(mat.cl), method = "ward.D2")
+  col_hc = if (ncol(mat.cl) > 1) hclust(dist(t(mat.cl))) else FALSE
+  na_legend = Legend(labels = "not scored", legend_gp = gpar(fill = "grey70"), title = "")
+
+  h = Heatmap(mat.in, name = "Kinase Activity", cluster_rows = row_hc, cluster_columns = col_hc, na_col = "grey70",
               cell_fun = function(j, i, x, y, width, height, fill){
                 if (mat.in.p[i,j]){
                   grid.rect(x = x, y = y, width = width, height = height, gp = gpar(col = "black", lwd=0.7,fill = NA))}
               })
-  draw(h)
+  draw(h, annotation_legend_list = list(na_legend))
   pdf(file = file.path(fig_dir, "DA_kinase_heatmap.pdf"),width=5, height=20)
-  print(h)
+  draw(h, annotation_legend_list = list(na_legend))
   dev.off()
-}
+  }
 
 }
 
